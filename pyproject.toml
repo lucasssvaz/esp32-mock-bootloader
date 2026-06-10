@@ -1,0 +1,73 @@
+[build-system]
+requires = ["hatchling>=1.25", "hatch-vcs>=0.4"]
+build-backend = "hatchling.build"
+
+[project]
+name = "esp32-mock-bootloader"
+dynamic = ["version"]
+description = "Mock ESP32 ROM bootloader (SLIP) for CI and local upload testing without hardware"
+readme = "README.md"
+license = "Apache-2.0"
+authors = [{ name = "Lucas Saavedra Vaz" }]
+keywords = ["esp32", "esptool", "bootloader", "ci", "embedded", "slip"]
+requires-python = ">=3.9"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Software Development :: Embedded Systems",
+    "Topic :: System :: Emulators",
+]
+dependencies = ["esptool"]
+
+[project.urls]
+Homepage = "https://github.com/lucasssvaz/esp32-mock-bootloader"
+Documentation = "https://github.com/lucasssvaz/esp32-mock-bootloader#readme"
+Repository = "https://github.com/lucasssvaz/esp32-mock-bootloader"
+Issues = "https://github.com/lucasssvaz/esp32-mock-bootloader/issues"
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-cov>=7", "pytest-xdist>=3"]
+dev = ["hatch", "hatch-vcs", "esp32-mock-bootloader[test]"]
+
+[project.scripts]
+esp32-mock-bootloader = "esp32_mock_bootloader.cli:main"
+
+[tool.hatch.version]
+source = "vcs"
+tag-pattern = "v(?P<version>.*)"
+fallback-version = "0.1.0"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/esp32_mock_bootloader"]
+
+[tool.hatch.build.targets.sdist]
+only-include = ["src", "README.md", "LICENSE", "pyproject.toml"]
+
+[tool.pytest.ini_options]
+# pytest-embedded is installed in many Espressif dev envs but is not used here;
+# without this, its record_xml_attribute hook warns on every test.
+# -n auto: parallel workers (requires pytest-xdist from .[test]); use pytest -n0 to disable.
+addopts = ["-p", "no:embedded", "-n", "auto"]
+markers = [
+    "esptool: integration tests that invoke the esptool CLI",
+    "transport: TCP and PTY transport integration tests",
+]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source_pkgs = ["esp32_mock_bootloader"]
+data_file = "reports/.coverage"
+parallel = true
+relative_files = true
+patch = ["subprocess"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise SystemExit",
+]
+show_missing = true
+skip_covered = false

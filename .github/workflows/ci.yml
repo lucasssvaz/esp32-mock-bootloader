@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package and test deps
+        run: pip install -e ".[test]"
+
+      - name: Record esptool version
+        shell: bash
+        run: |
+          {
+            echo '### esptool'
+            echo ''
+            esptool version 2>/dev/null || python -m esptool version
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Run tests with coverage
+        shell: bash
+        run: |
+          pytest --cov=esp32_mock_bootloader \
+            --cov-report=term-missing \
+            --cov-report=xml:reports/coverage.xml \
+            --cov-report=html:reports/htmlcov \
+            -v
+
+      - name: Check coverage baseline
+        if: runner.os == 'Linux'
+        run: python scripts/check_coverage.py
+
+      - name: Upload HTML coverage report
+        if: always() && runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: reports/htmlcov/
+
+      - name: Coverage summary
+        if: always()
+        shell: bash
+        run: |
+          python scripts/check_coverage.py \
+            --github-summary "$GITHUB_STEP_SUMMARY" \
+            --no-enforce \
+            $([ "${{ runner.os }}" = "Linux" ] && echo --artifact-note)
+
+  action:
+    name: GitHub Action integration tests
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Local action: main starts daemon, post step stops it when the job ends.
+      - name: Mock bootloader
+        uses: ./
+        id: mock
+        with:
+          port: "29876"
+          chip: auto
+          startup-timeout: "30"
+          python-version: "3.12"
+
+      - name: Check action outputs
+        shell: bash
+        run: |
+          test -n "${{ steps.mock.outputs.url }}"
+          test "${{ steps.mock.outputs.port }}" = "29876"
+          echo "url=${{ steps.mock.outputs.url }}"
+
+      - name: Daemon is running
+        shell: bash
+        run: esp32-mock-bootloader status --port 29876
+
+      - name: esptool write-flash via action URL
+        shell: bash
+        run: |
+          python -c "open('test.bin','wb').write(b'\\x00'*1024)"
+          esptool --chip esp32 \
+            --port "${{ steps.mock.outputs.url }}" \
+            --no-stub --before no-reset --after no-reset \
+            write-flash 0x10000 test.bin | tee flash.log
+          grep -E 'Wrote|Compressed' flash.log

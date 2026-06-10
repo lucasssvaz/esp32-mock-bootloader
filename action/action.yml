@@ -1,0 +1,32 @@
+name: esp32-mock-bootloader-daemon
+description: Start/stop mock bootloader daemon (internal; use root action.yml)
+inputs:
+  package-root:
+    description: Path to esp32-mock-bootloader package root
+    required: true
+  chip:
+    description: Chip profile (auto or explicit soc)
+    required: false
+    default: auto
+  port:
+    description: TCP port for the mock server
+    required: false
+    default: "9876"
+  startup-timeout:
+    description: Seconds to wait for the TCP port during startup
+    required: false
+    default: "30"
+  version:
+    description: PyPI version pin; empty installs from package-root
+    required: false
+    default: ""
+outputs:
+  port:
+    description: TCP port the mock server listens on
+  url:
+    description: socket:// URL for esptool or arduino-cli
+runs:
+  using: node24
+  main: start.js
+  post: stop.js
+  post-if: always()

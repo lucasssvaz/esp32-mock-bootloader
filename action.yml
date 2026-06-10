@@ -1,0 +1,52 @@
+name: esp32-mock-bootloader
+description: Mock ESP32 ROM bootloader daemon for CI upload testing (SLIP over TCP)
+branding:
+  icon: cpu
+  color: red
+
+inputs:
+  chip:
+    description: Chip profile (auto or explicit soc)
+    required: false
+    default: auto
+  port:
+    description: TCP port for the mock server
+    required: false
+    default: "9876"
+  startup-timeout:
+    description: Seconds to wait for the TCP port during startup
+    required: false
+    default: "30"
+  python-version:
+    description: Python version for setup-python
+    required: false
+    default: "3.x"
+  version:
+    description: PyPI version pin (e.g. 0.1.0); empty installs from action checkout
+    required: false
+    default: ""
+
+outputs:
+  port:
+    description: TCP port the mock server listens on
+    value: ${{ steps.daemon.outputs.port }}
+  url:
+    description: socket:// URL for esptool or arduino-cli
+    value: ${{ steps.daemon.outputs.url }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Mock bootloader daemon
+      id: daemon
+      uses: ./action
+      with:
+        package-root: ${{ github.workspace }}
+        chip: ${{ inputs.chip }}
+        port: ${{ inputs.port }}
+        startup-timeout: ${{ inputs.startup-timeout }}
+        version: ${{ inputs.version }}
