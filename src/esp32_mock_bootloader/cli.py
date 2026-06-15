@@ -9,11 +9,10 @@ import argparse
 import json
 import sys
 
-from esp32_mock_bootloader import daemon
-from esp32_mock_bootloader.chip_profiles import CHIP_PROFILES, SUPPORTED_CHIPS
+from esp32_mock_bootloader import chips, daemon
 from esp32_mock_bootloader.server import run_pty_server, run_server
 
-CHIP_CHOICES = sorted(CHIP_PROFILES.keys()) + ['auto']
+CHIP_CHOICES = sorted(chips.PROFILES.keys()) + ['auto']
 
 
 def _add_chip_port_bind_args(parser: argparse.ArgumentParser) -> None:
@@ -95,13 +94,13 @@ def _cmd_chips(args: argparse.Namespace) -> int:
                 'efuse_base': f'0x{profile.efuse_base:08x}',
                 'image_chip_id': profile.image_chip_id,
             }
-            for name, profile in CHIP_PROFILES.items()
+            for name, profile in chips.PROFILES.items()
         }
         print(json.dumps(payload, indent=2))
         return 0
 
-    for name in SUPPORTED_CHIPS:
-        profile = CHIP_PROFILES[name]
+    for name in chips.SUPPORTED:
+        profile = chips.PROFILES[name]
         chip_id = (
             'n/a'
             if profile.image_chip_id is None

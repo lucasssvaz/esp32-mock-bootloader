@@ -28,8 +28,9 @@ Run it on your machine or in CI. Point **esptool**, **arduino-cli**, or any ROM-
   - [PTY / serial path](#pty--serial-path)
   - [Windows with com0com](#windows-with-com0com)
 - [GitHub Actions](#github-actions)
-- [Client examples](#client-examples)
-- [How it works](#how-it-works)
+  - [Client examples](#client-examples)
+  - [Python API](#python-api)
+  - [How it works](#how-it-works)
 - [Protocol references](#protocol-references)
 - [Limitations](#limitations)
 - [Development](#development)
@@ -309,11 +310,48 @@ PORT="$(esp32-mock-bootloader url)"
 esp32-mock-bootloader stop
 ```
 
+## Python API
+
+Downstream projects can integrate the mock without shelling out to the CLI. Import **submodules by name** — avoid long symbol lists from the package root.
+
+| Tier | Import | Use case |
+|------|--------|----------|
+| High-level | `from esp32_mock_bootloader import MockBootloader` | CI scripts, pytest fixtures |
+| Testing helpers | `import esp32_mock_bootloader.testing as mock` | Protocol clients, esptool upload tests |
+| Chip metadata | `from esp32_mock_bootloader import chips` | `chips.PROFILES`, `chips.SUPPORTED` |
+| Protocol constants | `from esp32_mock_bootloader import protocol` | `protocol.CMD_SYNC`, checksum helpers |
+| Daemon control | `from esp32_mock_bootloader import daemon` | Background mock (`start_daemon` / `stop_daemon`) |
+| Advanced | `from esp32_mock_bootloader import server` | In-process SLIP handlers (unstable in 0.x) |
+
+**Context manager** (recommended for tests):
+
+```python
+from esp32_mock_bootloader import MockBootloader
+import esp32_mock_bootloader.testing as mock
+
+with MockBootloader(chip="auto") as bootloader:
+    sock = bootloader.connect()
+    mock.protocol.send_sync(sock)
+    # bootloader.url → "socket://127.0.0.1:PORT"
+```
+
+**esptool integration test** in another project:
+
+```python
+import esp32_mock_bootloader.testing as mock
+
+with mock.server.running_server(chip="esp32") as (_proc, port):
+    ok, detail = mock.esptool.write_flash_no_stub("esp32", "app.bin", port=port)
+    assert ok, detail
+```
+
+Reference constants (`FLASH_APP_OFFSET`, `SYNC_PAYLOAD`, …) live in `esp32_mock_bootloader.testing.constants`.
+
 ## How it works
 
 The mock speaks SLIP-framed ROM commands. Implemented handlers include:
 
-`SYNC`, `FLASH_BEGIN` / `DATA` / `END`, `FLASH_DEFL_*`, `MEM_*` (+ OHAI after `MEM_END`), `READ_REG`, `GET_SECURITY_INFO`, `WRITE_REG`, `SPI_SET_PARAMS`, `SPI_ATTACH`, `CHANGE_BAUDRATE`, `SPI_FLASH_MD5`.
+`SYNC`, `FLASH_BEGIN` / `DATA` / `END`, `FLASH_DEFL_*`, `MEM_*` (+ OHAI after `MEM_END`), `READ_REG`, `WRITE_REG` (with mask, readable via `READ_REG`), `GET_SECURITY_INFO`, `SPI_SET_PARAMS`, `SPI_ATTACH`, `CHANGE_BAUDRATE`, `SPI_FLASH_MD5`, `READ_FLASH_SLOW` (ROM), and stub-only `ERASE_FLASH`, `ERASE_REGION`, `READ_FLASH` (streaming + MD5), `RUN_USER_CODE`. `FLASH_DATA`, `MEM_DATA`, and `FLASH_DEFL_DATA` validate the 0xEF XOR checksum (ROM error `0x07`, stub error `0xC1`). Unknown commands return ROM error `0x05` or stub error `0xFF`.
 
 Flash data is stored in an in-memory image (erased bytes default to `0xFF`). After a stub upload (`MEM_END` with entrypoint + `OHAI`), `SPI_FLASH_MD5` returns a **16-byte binary** digest; in ROM mode it returns **32-byte lowercase hex ASCII** — matching esptool’s `flash_md5sum()` expectations. Unknown commands receive a generic ACK.
 
@@ -385,7 +423,12 @@ hatch build
 ```
 esp32-mock-bootloader/
 ├── CONTRIBUTING.md              # PR guidelines and AI policy
-├── src/esp32_mock_bootloader/   # Python package (CLI, daemon, SLIP server)
+├── src/esp32_mock_bootloader/   # Python package (api, testing, CLI, daemon, SLIP server)
+│   ├── api.py                   # MockBootloader context manager
+│   ├── testing/                 # Public helpers for downstream CI/tests
+│   ├── chips.py                 # Chip profiles from esptool
+│   ├── protocol.py              # Protocol constants
+│   └── server.py                # SLIP server (advanced)
 ├── action/                      # Node.js steps for the GitHub Action
 ├── action.yml                   # Composite action entry point
 ├── tests/                       # pytest suite (protocol, esptool, transports)

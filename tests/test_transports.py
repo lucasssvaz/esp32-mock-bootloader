@@ -12,88 +12,77 @@ import pytest
 
 import os
 
-from conftest import (
-    CHIP_PROFILES,
-    ESPTOOL_CHIPS,
-    TRANSPORTS,
-    reserve_tcp_port,
-    connect_transport,
-    create_fake_binary,
-    esptool_write_flash_no_stub,
-    minimal_plain_flash,
-    read_reg_value,
-    running_mock,
-    send_sync,
-)
+import esp32_mock_bootloader.testing as mock
+from esp32_mock_bootloader import chips
 
 pytestmark = [pytest.mark.transport, pytest.mark.esptool]
 
 
-@pytest.mark.parametrize('transport', TRANSPORTS)
-@pytest.mark.parametrize('chip', ESPTOOL_CHIPS)
+@pytest.mark.parametrize('transport', mock.constants.TRANSPORTS)
+@pytest.mark.parametrize('chip', mock.constants.ESPTOOL_CHIPS)
 def test_protocol_smoke(transport: str, chip: str):
-    with running_mock(transport, chip, timeout=30.0) as (proc, port, pty_path):
+    with mock.server.running_mock(transport, chip, timeout=30.0) as (proc, port, pty_path):
         assert proc.poll() is None
-        sock = connect_transport(transport, port=port, pty_path=pty_path)
+        sock = mock.server.connect_transport(transport, port=port, pty_path=pty_path)
         try:
-            assert minimal_plain_flash(sock)
+            assert mock.protocol.minimal_plain_flash(sock)
         finally:
             sock.close()
 
 
-@pytest.mark.parametrize('transport', TRANSPORTS)
-@pytest.mark.parametrize('chip', ESPTOOL_CHIPS)
+@pytest.mark.parametrize('transport', mock.constants.TRANSPORTS)
+@pytest.mark.parametrize('chip', mock.constants.ESPTOOL_CHIPS)
 def test_explicit_chip_detect_register(transport: str, chip: str):
-    profile = CHIP_PROFILES[chip]
+    profile = chips.PROFILES[chip]
     if not profile.detect_magic:
         pytest.skip(f'{chip} has no detect magic register')
-    with running_mock(transport, chip, timeout=30.0) as (_proc, port, pty_path):
-        sock = connect_transport(transport, port=port, pty_path=pty_path)
+    with mock.server.running_mock(transport, chip, timeout=30.0) as (_proc, port, pty_path):
+        sock = mock.server.connect_transport(transport, port=port, pty_path=pty_path)
         try:
-            send_sync(sock)
-            value = read_reg_value(sock, profile.detect_reg)
+            mock.protocol.send_sync(sock)
+            value = mock.protocol.read_reg_value(sock, profile.detect_reg)
             assert value == profile.detect_magic
         finally:
             sock.close()
 
 
-@pytest.mark.parametrize('transport', TRANSPORTS)
-@pytest.mark.parametrize('chip', ESPTOOL_CHIPS)
+@pytest.mark.parametrize('transport', mock.constants.TRANSPORTS)
+@pytest.mark.parametrize('chip', mock.constants.ESPTOOL_CHIPS)
 def test_chip_profile_registers(transport: str, chip: str):
-    profile = CHIP_PROFILES[chip]
-    with running_mock(transport, chip, timeout=30.0) as (_proc, port, pty_path):
-        sock = connect_transport(transport, port=port, pty_path=pty_path)
+    profile = chips.PROFILES[chip]
+    with mock.server.running_mock(transport, chip, timeout=30.0) as (_proc, port, pty_path):
+        sock = mock.server.connect_transport(transport, port=port, pty_path=pty_path)
         try:
-            send_sync(sock)
+            mock.protocol.send_sync(sock)
             if profile.detect_magic:
-                value = read_reg_value(sock, profile.detect_reg)
+                value = mock.protocol.read_reg_value(sock, profile.detect_reg)
                 assert value == profile.detect_magic
-            efuse_value = read_reg_value(sock, profile.efuse_base + 0x04)
+            efuse_value = mock.protocol.read_reg_value(sock, profile.efuse_base + 0x04)
             assert efuse_value == 0
-            assert minimal_plain_flash(sock)
+            assert mock.protocol.minimal_plain_flash(sock)
         finally:
             sock.close()
 
 
-@pytest.mark.parametrize('transport', TRANSPORTS)
-@pytest.mark.parametrize('chip', ESPTOOL_CHIPS)
+@pytest.mark.parametrize('transport', mock.constants.TRANSPORTS)
+@pytest.mark.parametrize('chip', mock.constants.ESPTOOL_CHIPS)
 def test_esptool_write_flash(transport: str, chip: str):
-    with running_mock(transport, chip, timeout=30.0) as (_proc, port, pty_path):
+    with mock.server.running_mock(transport, chip, timeout=30.0) as (_proc, port, pty_path):
         with tempfile.TemporaryDirectory() as tmp:
-            bin_file = create_fake_binary(Path(tmp) / 'test.bin', 1024)
-            wrote_ok, detail = esptool_write_flash_no_stub(
+            bin_file = mock.esptool.create_fake_binary(Path(tmp) / 'test.bin', 1024)
+            wrote_ok, detail = mock.esptool.write_flash_no_stub(
                 chip, str(bin_file), port=port, pty_path=pty_path,
             )
             assert wrote_ok, detail
 
 
-@pytest.mark.parametrize('transport', TRANSPORTS)
-@pytest.mark.parametrize('chip', ESPTOOL_CHIPS)
+@pytest.mark.parametrize('transport', mock.constants.TRANSPORTS)
+@pytest.mark.parametrize('chip', mock.constants.ESPTOOL_CHIPS)
 def test_auto_mode_esptool_write_flash(transport: str, chip: str):
-    with running_mock(transport, 'auto', timeout=30.0) as (_proc, port, pty_path):
+    with mock.server.running_mock(transport, 'auto', timeout=30.0) as (_proc, port, pty_path):
         with tempfile.TemporaryDirectory() as tmp:
-            bin_file = create_fake_binary(Path(tmp) / 'test.bin', 1024)
-            wrote_ok, detail = esptool_write_flash_no_stub(
+            bin_file = mock.esptool.create_fake_binary(Path(tmp) / 'test.bin', 1024)
+            wrote_ok, detail = mock.esptool.write_flash_no_stub(
                 chip, str(bin_file), port=port, pty_path=pty_path,
             )
             assert wrote_ok, detail
@@ -103,10 +92,8 @@ def test_pty_path_file_written(tmp_path: Path):
     path_file = tmp_path / 'mock.pty'
     proc = None
     try:
-        from conftest import read_pty_path, start_mock_pty
-
-        proc = start_mock_pty(path_file, timeout=30.0, chip='auto')
-        endpoint = read_pty_path(path_file)
+        proc = mock.server.start_pty(path_file, timeout=30.0, chip='auto')
+        endpoint = mock.server.read_pty_path(path_file)
         assert endpoint
         if os.environ.get('ESP32_MOCK_COM_PORT'):
             assert endpoint == os.environ.get('ESP32_MOCK_COM_PEER', 'COM19')
@@ -114,9 +101,9 @@ def test_pty_path_file_written(tmp_path: Path):
             assert endpoint.startswith('socket://')
         else:
             assert Path(endpoint).exists()
-        sock = connect_transport('pty', pty_path=endpoint)
+        sock = mock.server.connect_transport('pty', pty_path=endpoint)
         try:
-            assert minimal_plain_flash(sock)
+            assert mock.protocol.minimal_plain_flash(sock)
         finally:
             sock.close()
     finally:
@@ -136,11 +123,11 @@ def test_windows_com0com_esptool():
         with com0com_pair(com_server, com_peer) as pair:
             os.environ['ESP32_MOCK_COM_PORT'] = pair.server
             os.environ['ESP32_MOCK_COM_PEER'] = pair.peer
-            with running_mock('pty', 'auto', timeout=60.0) as (_proc, _port, endpoint):
+            with mock.server.running_mock('pty', 'auto', timeout=60.0) as (_proc, _port, endpoint):
                 with tempfile.TemporaryDirectory() as tmp:
-                    bin_file = create_fake_binary(Path(tmp) / 'test.bin', 1024)
+                    bin_file = mock.esptool.create_fake_binary(Path(tmp) / 'test.bin', 1024)
                     assert endpoint == pair.peer
-                    wrote_ok, detail = esptool_write_flash_no_stub(
+                    wrote_ok, detail = mock.esptool.write_flash_no_stub(
                         'esp32', str(bin_file), pty_path=endpoint,
                     )
                     assert wrote_ok, detail
@@ -152,7 +139,7 @@ def test_tcp_daemon_start_stop(tmp_path: Path):
     """TCP daemon CLI path (PTY has no background daemon)."""
     from esp32_mock_bootloader import daemon
 
-    port = reserve_tcp_port()
+    port = mock.server.reserve_tcp_port()
     state_dir = tmp_path / 'state'
     try:
         data = daemon.start_daemon(port=port, chip_mode='auto', base=state_dir)
@@ -160,8 +147,8 @@ def test_tcp_daemon_start_stop(tmp_path: Path):
         status = daemon.daemon_status(port, state_dir)
         assert status['running']
         with tempfile.TemporaryDirectory() as tmp:
-            bin_file = create_fake_binary(Path(tmp) / 'test.bin', 512)
-            wrote_ok, detail = esptool_write_flash_no_stub(
+            bin_file = mock.esptool.create_fake_binary(Path(tmp) / 'test.bin', 512)
+            wrote_ok, detail = mock.esptool.write_flash_no_stub(
                 'esp32', str(bin_file), port=port,
             )
             assert wrote_ok, detail

@@ -112,6 +112,6 @@ def reference_chip() -> str:
     return supported_chips()[0]
 
 
-# Eager alias used across the package (rebuilt when esptool is upgraded).
-CHIP_PROFILES: dict[str, ChipProfile] = get_chip_profiles()
-SUPPORTED_CHIPS: tuple[str, ...] = supported_chips()
+# Eager tables used across the package (rebuilt when esptool is upgraded).
+PROFILES: dict[str, ChipProfile] = get_chip_profiles()
+SUPPORTED: tuple[str, ...] = supported_chips()

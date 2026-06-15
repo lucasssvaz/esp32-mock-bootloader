@@ -12,9 +12,9 @@ import sys
 import pytest
 
 from esp32_mock_bootloader import daemon
-from esp32_mock_bootloader.chip_profiles import SUPPORTED_CHIPS
+from esp32_mock_bootloader import chips
 
-from conftest import reserve_tcp_port
+import esp32_mock_bootloader.testing as mock
 
 
 def _cli(*args: str) -> subprocess.CompletedProcess[str]:
@@ -35,7 +35,7 @@ def test_cli_url_default():
 def test_cli_lists_supported_chips():
     result = _cli('chips')
     assert result.returncode == 0
-    for chip in SUPPORTED_CHIPS:
+    for chip in chips.SUPPORTED:
         assert chip in result.stdout
 
 
@@ -43,13 +43,13 @@ def test_cli_chips_json():
     result = _cli('chips', '--json')
     assert result.returncode == 0
     payload = json.loads(result.stdout)
-    assert set(payload.keys()) == set(SUPPORTED_CHIPS)
-    for chip in SUPPORTED_CHIPS:
+    assert set(payload.keys()) == set(chips.SUPPORTED)
+    for chip in chips.SUPPORTED:
         assert 'detect_reg' in payload[chip]
 
 
 def test_cli_status_human_readable(tmp_path):
-    port = reserve_tcp_port()
+    port = mock.server.reserve_tcp_port()
     state_dir = tmp_path / 'daemon-state'
     try:
         start = _cli(
@@ -74,9 +74,9 @@ def test_cli_status_stopped_exit_code(tmp_path):
 
 
 def test_start_status_stop_round_trip(tmp_path):
-    port = reserve_tcp_port()
+    port = mock.server.reserve_tcp_port()
     state_dir = tmp_path / 'daemon-state'
-    chip = SUPPORTED_CHIPS[0]
+    chip = chips.SUPPORTED[0]
 
     start = _cli(
         'start', '--port', str(port), '--chip', chip,
@@ -104,7 +104,7 @@ def test_start_status_stop_round_trip(tmp_path):
 
 
 def test_start_refuses_double_start(tmp_path):
-    port = reserve_tcp_port()
+    port = mock.server.reserve_tcp_port()
     state_dir = tmp_path / 'daemon-state'
     try:
         first = _cli(

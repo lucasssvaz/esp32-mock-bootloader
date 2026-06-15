@@ -13,7 +13,7 @@ import pytest
 
 from esp32_mock_bootloader import daemon
 
-from conftest import reserve_tcp_port
+import esp32_mock_bootloader.testing as mock
 
 
 def test_socket_url_wildcard_bind():
@@ -42,7 +42,7 @@ def test_stop_daemon_stale_pid(tmp_path):
 
 
 def test_start_force_replaces_daemon(tmp_path):
-    port = reserve_tcp_port()
+    port = mock.server.reserve_tcp_port()
     state_dir = tmp_path / 'state'
     try:
         first = daemon.start_daemon(port=port, chip_mode='auto', base=state_dir)
@@ -79,7 +79,7 @@ def _cli(*args: str) -> subprocess.CompletedProcess[str]:
 
 
 def test_cli_start_force(tmp_path):
-    port = reserve_tcp_port()
+    port = mock.server.reserve_tcp_port()
     state_dir = tmp_path / 'state'
     try:
         assert _cli(
