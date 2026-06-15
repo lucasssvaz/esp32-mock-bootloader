@@ -1,19 +1,10 @@
 {
-  "total": 68.0,
+  "total": 69.0,
   "packages": {
-    "esp32_mock_bootloader": 66.0,
-    "__init__": 70.0,
-    "api": 80.0,
-    "chips": 87.0,
-    "cli": 94.0,
-    "com0com": 45.0,
-    "daemon": 77.0,
-    "protocol": 95.0,
-    "server": 58.0,
-    "testing/__init__": 95.0,
-    "testing/constants": 95.0,
-    "testing/esptool": 80.0,
-    "testing/protocol": 88.0,
-    "testing/server": 48.0
+    "server": 59.0,
+    "registers": 87.0,
+    "com0com": 48.0,
+    "daemon": 80.0,
+    "cli": 97.0
   }
 }

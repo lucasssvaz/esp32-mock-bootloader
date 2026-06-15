@@ -1,5 +1,11 @@
 # Test coverage reports
 
+Coverage measures how well the **test suite exercises the mock bootloader
+implementation** (`server`, `cli`, `daemon`, `registers`, …). It does **not**
+include `esp32_mock_bootloader.testing` — that subpackage is integration helper
+code used *by* the tests (and by downstream CI consumers), not the ROM mock
+itself. Helpers are omitted via `omit` in `pyproject.toml`.
+
 ## Local run
 
 ```bash
@@ -36,3 +42,10 @@ After adding tests and confirming coverage improved:
 1. Run the local commands above.
 2. Edit `coverage-baseline.json` with new minimums (do not lower without reason).
 3. Commit the updated baseline.
+
+Baseline shape:
+
+- **`total`** — project-wide floor for product code.
+- **Per-module floors** — only for large or high-risk modules where a drop would
+  not move `total` much (`server`, `registers`, `com0com`, …). Tiny constant
+  modules and `testing/*` are intentionally excluded.

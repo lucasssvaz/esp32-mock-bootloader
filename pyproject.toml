@@ -58,6 +58,9 @@ testpaths = ["tests"]
 
 [tool.coverage.run]
 source_pkgs = ["esp32_mock_bootloader"]
+omit = [
+    "*/esp32_mock_bootloader/testing/*",
+]
 data_file = "reports/.coverage"
 parallel = true
 relative_files = true
