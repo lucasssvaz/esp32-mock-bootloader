@@ -16,6 +16,7 @@ Bug reports and feature requests are welcome via [GitHub Issues](https://github.
 - Match existing style and keep changes focused.
 - Add or update tests for behavior you change.
 - All CI checks must pass before merge.
+- Do not add **espefuse** integration tests against the mock unless explicitly scoped (e.g. connect fails gracefully or partial `summary` smoke tests). Use `espefuse --virt` for efuse burn/read testing without hardware.
 
 ### Import conventions
 

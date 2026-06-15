@@ -20,6 +20,7 @@ import pytest
 
 from esp32_mock_bootloader import protocol
 from esp32_mock_bootloader import chips
+from esp32_mock_bootloader import registers
 
 import esp32_mock_bootloader.testing as mock
 
@@ -62,22 +63,26 @@ def test_read_reg_chip_detect(mock_server, reference_chip):
     sock.close()
 
 
+from esp32_mock_bootloader import registers
+
+
 def test_read_reg_efuse(mock_server, reference_chip):
     port, _proc = mock_server
     profile = chips.PROFILES[reference_chip]
     sock = mock.server.connect(port)
     mock.protocol.send_sync(sock)
+    efuse_addr = profile.efuse_base + 0x04
     raw = mock.protocol.send_and_receive(
         sock,
         mock.protocol.make_command(
-            protocol.CMD_READ_REG, struct.pack('<I', profile.efuse_base + 0x04),
+            protocol.CMD_READ_REG, struct.pack('<I', efuse_addr),
         ),
     )
-    # Unprogrammed eFuse words read as 0.
+    expected = registers.rom_profile(reference_chip).get(efuse_addr, 0)
     frames = mock.protocol.slip_decode_frames(raw)
     assert len(frames) >= 1
     _d, _c, _s, value, _data = mock.protocol.parse_response(frames[0])
-    assert value == 0
+    assert value == expected
     sock.close()
 
 

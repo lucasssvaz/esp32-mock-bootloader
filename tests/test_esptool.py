@@ -17,6 +17,7 @@ import pytest
 import esp32_mock_bootloader.testing as mock
 from esp32_mock_bootloader import protocol
 from esp32_mock_bootloader import chips
+from esp32_mock_bootloader import registers
 
 pytestmark = pytest.mark.esptool
 
@@ -78,7 +79,7 @@ def test_esptool_chip_id(esptool_port, reference_chip):
         '--no-stub',
         '--before', 'no-reset',
         '--after', 'no-reset',
-        'chip_id',
+        'chip-id',
     )
     connected = (
         'Connecting' in result.stdout
@@ -139,8 +140,10 @@ def test_all_esptool_chips_chip_profiles():
                     f'got {None if value is None else f"0x{value:08X}"}'
                 )
 
-            efuse_value = mock.protocol.read_reg_value(sock, profile.efuse_base + 0x04)
-            assert efuse_value == 0
+            efuse_addr = profile.efuse_base + 0x04
+            efuse_value = mock.protocol.read_reg_value(sock, efuse_addr)
+            expected = registers.rom_profile(chip).get(efuse_addr, 0)
+            assert efuse_value == expected
 
             assert mock.protocol.minimal_plain_flash(sock)
             sock.close()

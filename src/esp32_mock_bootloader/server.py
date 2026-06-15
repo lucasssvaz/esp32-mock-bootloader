@@ -18,6 +18,7 @@ from typing import Callable
 
 from esp32_mock_bootloader import chips
 from esp32_mock_bootloader import protocol
+from esp32_mock_bootloader import registers
 from esptool.targets import CHIP_DEFS
 
 
@@ -119,10 +120,19 @@ class ChipSession:
             self._logged_detection = True
 
     def image_chip_id(self) -> int:
-        if self.detected_chip is not None:
-            chip_id = chips.PROFILES[self.detected_chip].image_chip_id
-            return 0 if chip_id is None else chip_id
-        return 0
+        chip = _profile_chip(self)
+        if chip is None:
+            return 0
+        chip_id = chips.PROFILES[chip].image_chip_id
+        return 0 if chip_id is None else chip_id
+
+
+def _profile_chip(session: ChipSession) -> str | None:
+    if session.chip_mode != 'auto':
+        return session.chip_mode
+    if session.detected_chip is not None:
+        return session.detected_chip
+    return None
 
 
 def _chips_matching_efuse(addr: int) -> list[str]:
@@ -154,12 +164,7 @@ def _infer_chip_from_addr(addr: int) -> str | None:
 
 
 def _read_reg_value_for_chip(addr: int, chip: str) -> int:
-    profile = chips.PROFILES[chip]
-    if profile.detect_magic and addr == profile.detect_reg:
-        return profile.detect_magic
-    if profile.efuse_base <= addr < profile.efuse_base + protocol.EFUSE_WINDOW:
-        return 0
-    return 0
+    return registers.read_reg_value(chip, addr)
 
 
 class FlashImage:
@@ -380,7 +385,11 @@ def handle_read_reg(data: bytes, session: ChipSession) -> bytes:
         return make_response(protocol.CMD_READ_REG, value=0, stub=session.stub_active)
 
     inferred = _infer_chip_from_addr(addr)
-    if inferred is not None:
+    if inferred is not None and session.detected_chip is None:
+        session.note_detection(inferred, f'READ_REG 0x{addr:08x}')
+        if _chips_matching_efuse(addr):
+            return make_response(protocol.CMD_READ_REG, value=0, stub=session.stub_active)
+    elif inferred is not None:
         session.note_detection(inferred, f'READ_REG 0x{addr:08x}')
 
     if session.detected_chip is not None:
@@ -520,9 +529,7 @@ def perform_read_flash_stream(
 
 
 def _active_chip(session: ChipSession) -> str | None:
-    if session.chip_mode != 'auto':
-        return session.chip_mode
-    return session.detected_chip
+    return _profile_chip(session)
 
 
 def handle_get_security_info(session: ChipSession) -> bytes:
@@ -535,9 +542,11 @@ def handle_get_security_info(session: ChipSession) -> bytes:
             error=protocol.ROM_INVALID_MESSAGE,
             stub=session.stub_active,
         )
-    if session.chip_mode != 'auto' or session.detected_chip is not None:
+    if active is not None:
         chip_id = session.image_chip_id()
-        payload = struct.pack('<IBBBBBBBBII', 0, 0, 0, 0, 0, 0, 0, 0, 0, chip_id, 0)
+        payload = struct.pack(
+            '<IBBBBBBBBII', 0, 0, 0, 0, 0, 0, 0, 0, 0, chip_id, 0,
+        ) + b'\x00\x00'
         header = struct.pack('<BBHI', 0x01, protocol.CMD_GET_SECURITY_INFO, len(payload), 0)
         return slip_encode(header + payload)
 
@@ -856,7 +865,12 @@ def _tcp_listen_loop(
             except socket.timeout:
                 continue
             print(f'Connection from {addr}', flush=True)
-            handle_client(BootloaderConnection(sock=conn), stop_event, chip_mode, on_detected)
+            handle_client(
+                BootloaderConnection(sock=conn),
+                stop_event,
+                chip_mode,
+                on_detected,
+            )
             print('Client disconnected', flush=True)
     except KeyboardInterrupt:
         pass
@@ -885,10 +899,8 @@ def run_server(
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((bind, port))
     srv.listen(1)
-    _tcp_listen_loop(
-        srv, timeout, chip_mode, on_detected,
-        f'Mock bootloader (chip={chip_mode}) listening on {bind}:{port}',
-    )
+    label = f'Mock bootloader (chip={chip_mode}) listening on {bind}:{port}'
+    _tcp_listen_loop(srv, timeout, chip_mode, on_detected, label)
 
 
 def _run_unix_pty_server(
@@ -994,13 +1006,16 @@ def run_pty_server(
     pty_path_file: str | None,
     chip_mode: str = 'auto',
     state_file: str | None = None,
+    *,
     com_port: str | None = None,
     com_peer: str | None = None,
 ) -> None:
     on_detected = _make_on_detected(state_file)
     com_pair = resolve_com_ports(com_port, com_peer)
     if com_pair is not None:
-        _run_com_server(*com_pair, timeout, pty_path_file, chip_mode, on_detected)
+        _run_com_server(
+            *com_pair, timeout, pty_path_file, chip_mode, on_detected,
+        )
     elif os.name == 'nt':
         _run_windows_pty_server(timeout, pty_path_file, chip_mode, on_detected)
     else:

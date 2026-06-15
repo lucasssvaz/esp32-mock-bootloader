@@ -58,15 +58,26 @@ def test_get_security_info_esp8266_returns_error():
     assert data[0] != 0
 
 
-def test_get_security_info_after_explicit_chip():
+def test_get_security_info_esp32_returns_error():
     session = server.ChipSession('esp32')
     raw = server.handle_get_security_info(session)
     frames = server.slip_decode_frames(raw)
     _d, c, _s, _v, data = mock.protocol.parse_response(frames[0])
     assert c == protocol.CMD_GET_SECURITY_INFO
+    assert data[0] != 0
+
+
+def test_get_security_info_modern_chip():
+    session = server.ChipSession('esp32c3')
+    raw = server.handle_get_security_info(session)
+    frames = server.slip_decode_frames(raw)
+    _d, c, size, _v, data = mock.protocol.parse_response(frames[0])
+    assert c == protocol.CMD_GET_SECURITY_INFO
+    assert size == 22
     assert data[0] == 0
     chip_id = struct.unpack_from('<I', data, 12)[0]
-    assert chip_id == chips.PROFILES['esp32'].image_chip_id
+    assert chip_id == chips.PROFILES['esp32c3'].image_chip_id
+    assert data[20:22] == b'\x00\x00'
 
 
 def test_handle_read_reg_legacy_deferred_in_auto():

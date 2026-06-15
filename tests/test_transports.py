@@ -12,6 +12,7 @@ import pytest
 
 import os
 
+from esp32_mock_bootloader import registers
 import esp32_mock_bootloader.testing as mock
 from esp32_mock_bootloader import chips
 
@@ -57,8 +58,10 @@ def test_chip_profile_registers(transport: str, chip: str):
             if profile.detect_magic:
                 value = mock.protocol.read_reg_value(sock, profile.detect_reg)
                 assert value == profile.detect_magic
-            efuse_value = mock.protocol.read_reg_value(sock, profile.efuse_base + 0x04)
-            assert efuse_value == 0
+            efuse_addr = profile.efuse_base + 0x04
+            efuse_value = mock.protocol.read_reg_value(sock, efuse_addr)
+            expected = registers.rom_profile(chip).get(efuse_addr, 0)
+            assert efuse_value == expected
             assert mock.protocol.minimal_plain_flash(sock)
         finally:
             sock.close()

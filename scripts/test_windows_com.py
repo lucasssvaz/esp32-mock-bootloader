@@ -22,6 +22,7 @@ import time
 from pathlib import Path
 
 from esp32_mock_bootloader.com0com import Com0ComError, com0com_pair
+import esp32_mock_bootloader.testing as mock
 
 COM_SERVER = os.environ.get('ESP32_MOCK_COM_PORT', 'COM18')
 COM_PEER = os.environ.get('ESP32_MOCK_COM_PEER', 'COM19')
@@ -56,7 +57,7 @@ def _run_flash_test(com_server: str, com_peer: str) -> int:
                 '--pty-path-file', str(path_file),
                 '--com-port', com_server,
                 '--com-peer', com_peer,
-                '--chip', 'auto',
+                '--chip', 'esp32',
                 '--timeout', '120',
             ],
             stdout=subprocess.PIPE,
@@ -80,6 +81,40 @@ def _run_flash_test(com_server: str, com_peer: str) -> int:
 
             print(f'com0com pair {com_server} <-> {com_peer}')
             print(f'Mock on {com_server}, client port {client_port}')
+
+            flash_id = subprocess.run(
+                [
+                    sys.executable, '-m', 'esptool',
+                    '--chip', 'esp32',
+                    '--port', client_port,
+                    '--no-stub',
+                    '--before', 'no-reset',
+                    '--after', 'no-reset',
+                    'flash-id',
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            fid_output = flash_id.stdout + flash_id.stderr
+            if flash_id.returncode != 0:
+                return _fail(
+                    f'flash-id failed (rc={flash_id.returncode})\n'
+                    f'stdout:\n{flash_id.stdout[-800:]}\n'
+                    f'stderr:\n{flash_id.stderr[-400:]}',
+                )
+            vid_pid_lines = [
+                line.strip() for line in fid_output.splitlines()
+                if 'VID/PID' in line
+            ]
+            if vid_pid_lines:
+                print('VID/PID lines (expected on com0com):')
+                for line in vid_pid_lines:
+                    print(f'  {line}')
+            warns = mock.esptool.forbidden_warnings(fid_output, transport='pty')
+            if warns:
+                return _fail('Unexpected esptool warnings on flash-id:\n' + '\n'.join(warns))
+
             esptool = subprocess.run(
                 [
                     sys.executable, '-m', 'esptool',

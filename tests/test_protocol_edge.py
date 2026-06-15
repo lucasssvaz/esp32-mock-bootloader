@@ -57,6 +57,7 @@ def test_read_reg_legacy_deferred_until_chip_evidence():
 
 
 def test_get_security_info_explicit_chip():
+    """ESP32 uses magic validation; GET_SECURITY_INFO is unsupported on ROM."""
     proc, port = mock.server.start_server(chip='esp32')
     try:
         sock = mock.server.connect(port)
@@ -64,9 +65,27 @@ def test_get_security_info_explicit_chip():
         raw = mock.protocol.send_and_receive(sock, mock.protocol.make_command(protocol.CMD_GET_SECURITY_INFO))
         _d, c, _s, _v, data = mock.protocol.parse_response(mock.protocol.slip_decode_frames(raw)[0])
         assert c == protocol.CMD_GET_SECURITY_INFO
+        assert data[0] != 0
+        sock.close()
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+
+def test_get_security_info_modern_chip():
+    proc, port = mock.server.start_server(chip='esp32c3')
+    try:
+        sock = mock.server.connect(port)
+        mock.protocol.send_sync(sock)
+        raw = mock.protocol.send_and_receive(sock, mock.protocol.make_command(protocol.CMD_GET_SECURITY_INFO))
+        _d, c, size, _v, data = mock.protocol.parse_response(mock.protocol.slip_decode_frames(raw)[0])
+        assert c == protocol.CMD_GET_SECURITY_INFO
         assert data[0] == 0
+        assert size == 22
         chip_id = struct.unpack_from('<I', data, 12)[0]
-        assert chip_id == chips.PROFILES['esp32'].image_chip_id
+        assert chip_id == chips.PROFILES['esp32c3'].image_chip_id
+        assert data[20:22] == b'\x00\x00'
         sock.close()
     finally:
         if proc.poll() is None:

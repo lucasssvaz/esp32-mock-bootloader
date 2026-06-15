@@ -156,7 +156,7 @@ Common flags for `start` and `run`:
 {
   "pid": 12345,
   "port": 9876,
-  "chip": "auto",
+  "chip": "esp32",
   "url": "socket://127.0.0.1:9876",
   "detected_chip": "esp32"
 }
@@ -166,16 +166,53 @@ Common flags for `start` and `run`:
 
 ### Chip selection
 
-| Mode | When to use |
-|------|-------------|
-| `--chip auto` | Client passes its own `--chip`; mock learns from registers (recommended for CI matrices) |
-| `--chip esp32`, `esp32c6`, … | Fixed profile for every session |
+esptool’s `--chip` flag is **client-side only** — it is never sent over the serial link. The mock cannot read it. Choose the mock profile to match how your upload client selects the SoC:
+
+| Mock `--chip` | Client | Connect fidelity |
+|---------------|--------|------------------|
+| `esp32`, `esp32c3`, … | `esptool --chip <same>` | Full ROM profile (MAC, crystal, security-info) — **recommended for CI** |
+| `esp32`, `esp32c3`, … | `esptool --chip auto` | esptool autodetects from ROM probes against the fixed mock profile |
+| `auto` | `esptool --chip auto` | Mock learns the SoC from esptool’s standard detection probes |
+| `auto` | `esptool --chip <explicit>` | Upload usually works; connect may warn until chip-specific registers are read |
+
+**Recommended CI pattern** — one virtual board per job, matching chips:
+
+```bash
+esp32-mock-bootloader start --chip esp32c3
+esptool --chip esp32c3 --port "$(esp32-mock-bootloader url)" flash-id
+```
+
+Or let esptool autodetect against a fixed mock profile:
+
+```bash
+esp32-mock-bootloader start --chip esp32c3
+esptool --chip auto --port "$(esp32-mock-bootloader url)" flash-id
+```
+
+Use mock `--chip auto` when the client also uses `--chip auto`, or when you need the mock to learn the SoC from chip-specific register traffic (for example multi-SoC protocol tests).
 
 In `auto` mode the mock:
 
-1. Returns a ROM-style error on the first `GET_SECURITY_INFO` so clients do not lock onto ESP32 via `chip_id` 0.
+1. Returns a ROM-style error on `GET_SECURITY_INFO` until a SoC is known.
 2. Returns `0` for the legacy probe at `0x40001000` until chip-specific registers identify the SoC.
 3. Sets `detected_chip` from unique detect registers or efuse windows (addresses from esptool ROM classes).
+
+**ROM profile:** For explicit chip modes (and after auto detection), `READ_REG` returns a sparse set of register values derived from esptool ROM classes — synthetic MAC, crystal calibration (`UART_CLKDIV`, ESP32 `RTCCALICFG1`), and security-off defaults. This is not a full efuse block emulator; see [espefuse](#espefuse).
+
+#### Synthetic MAC
+
+esptool's `flash-id` prints a MAC decoded from efuse/OTP registers. The mock fills those registers with a **synthetic BASE_MAC** so the line is non-zero and passes each chip family's `read_mac()` logic. No particular address is required for protocol correctness.
+
+| Property | Value |
+|----------|-------|
+| OUI | `24:0A:C4` (Espressif; not a real burned address on the mock) |
+| Host suffix | First 3 bytes of `SHA256("<chip>")`, e.g. `esp32` → `e2:95:26` |
+| Stability | Same `--chip` always yields the same MAC across runs |
+| Uniqueness | Different SoC names get different suffixes (helps multi-chip CI logs) |
+
+Examples: `esp32` → `24:0a:c4:e2:95:26`, `esp32c3` → `24:0a:c4:1f:67:7d`, `esp8266` → `24:0a:c4:ce:2b:c1`.
+
+To compute the expected MAC in a test: `registers.mac_bytes_for_chip("esp32c3")` or the formula above. A single fixed MAC for all chips would also work with esptool; the per-chip suffix is a readability choice, not a hardware requirement.
 
 ### Supported chips
 
@@ -199,6 +236,18 @@ esp32-mock-bootloader start --port 9876
 esptool --chip esp32c6 --port socket://127.0.0.1:9876 write-flash 0x10000 app.bin
 ```
 
+### VID/PID messages
+
+esptool reads USB vendor/product IDs only from real USB serial devices (Espressif VID `0x303A`). Virtual transports cannot provide those descriptors:
+
+| Transport | Typical esptool message | Fixable by mock? |
+|-----------|-------------------------|------------------|
+| `socket://` | `Device VID/PID identification is only supported on COM and /dev/ serial ports.` | No — document only |
+| Unix PTY (`/dev/ttys…`) | `Failed to get VID/PID of a device on /dev/ttys…` | No — PTY is not a USB device |
+| Windows com0com (`COMx`) | Same `Failed to get VID/PID` — virtual pairs have no USB descriptors | No |
+
+These messages are harmless for upload tests. Only a physical Espressif USB-Serial/JTAG adapter silences them.
+
 ### PTY / serial path
 
 Use `--pty` with `run` when a tool expects a **device path** instead of a URL (common with arduino-cli):
@@ -220,9 +269,11 @@ Install [com0com](https://sourceforge.net/projects/com0com/). Run the mock on th
 
 ```bat
 esp32-mock-bootloader run --pty --pty-path-file mock.port ^
-  --com-port COM18 --com-peer COM19 --chip auto
+  --com-port COM18 --com-peer COM19 --chip esp32
 esptool --chip esp32 --port COM19 write-flash 0x10000 firmware.bin
 ```
+
+Expect `Failed to get VID/PID` on com0com ports (see [VID/PID messages](#vidpid-messages)).
 
 Environment variables `ESP32_MOCK_COM_PORT` and `ESP32_MOCK_COM_PEER` work the same as `--com-port` / `--com-peer`.
 
@@ -378,7 +429,27 @@ Implementation follows Espressif’s published bootloader protocol and the **esp
 - **Protocol emulator only** — no application code runs on the mock.
 - **Client packaging matters** — some bundled esptool builds lack `socket://`; use PTY/COM or pip esptool.
 - **com0com is local** — GitHub-hosted Windows runners use the socket fallback automatically.
+- **VID/PID noise on virtual ports** — socket, PTY, and com0com cannot expose Espressif USB descriptors; esptool prints informational VID/PID messages (see [Transports](#transports)).
 - **Alpha API** — expect changes before `1.0.0`.
+
+### espefuse
+
+This mock targets **esptool** ROM upload clients (`write-flash`, `flash-id`, stub upload). It is **not** an efuse programmer.
+
+| Tool / mode | Use with mock? |
+|-------------|----------------|
+| `espefuse --virt` | **Yes** — in-process efuse emulation for host-side tests (no serial port) |
+| `espefuse --port …` read/burn commands | **No** — requires on-chip efuse controller `WRITE_REG` sequences and persistent burned state |
+
+After connect, the mock exposes a **sparse ROM profile** (MAC, crystal registers, security-off defaults) so esptool connect paths behave plausibly. That is not espefuse field parity:
+
+| espefuse command | Mock support |
+|------------------|--------------|
+| `summary` | Partial / best-effort only — most named fields stay at defaults |
+| `dump`, `adc-info`, `check-error` | No — unmapped addresses read as `0` |
+| `burn-*`, `read-protect-efuse`, `write-protect-efuse` | No — permanently out of scope unless a full efuse controller emulator is added |
+
+Supported chips follow installed esptool `CHIP_DEFS`. [espefuse supported chips](https://github.com/espressif/esptool/tree/master/espefuse) are a subset (no ESP8266).
 
 ## Development
 
@@ -427,6 +498,7 @@ esp32-mock-bootloader/
 │   ├── api.py                   # MockBootloader context manager
 │   ├── testing/                 # Public helpers for downstream CI/tests
 │   ├── chips.py                 # Chip profiles from esptool
+│   ├── registers.py             # Sparse ROM register profile for esptool fidelity
 │   ├── protocol.py              # Protocol constants
 │   └── server.py                # SLIP server (advanced)
 ├── action/                      # Node.js steps for the GitHub Action

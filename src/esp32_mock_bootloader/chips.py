@@ -29,7 +29,9 @@ class ChipProfile:
 
     @property
     def supports_security_info(self) -> bool:
-        return self.image_chip_id is not None
+        # Magic-based ROM targets (ESP32, ESP32-S2, ESP8266) must not answer
+        # GET_SECURITY_INFO with a chip_id — esptool then skips magic validation.
+        return self.image_chip_id is not None and not self.uses_magic_value
 
 
 def _efuse_base(rom_cls: type) -> int:

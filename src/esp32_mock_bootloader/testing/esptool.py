@@ -55,6 +55,52 @@ def _write_flash_detail(result: subprocess.CompletedProcess[str]) -> str:
     )
 
 
+def forbidden_warnings(
+    output: str,
+    *,
+    transport: str = 'socket',
+) -> list[str]:
+    """Return esptool Warning lines that are not allowed for mock fidelity tests."""
+    allowed_fragments = (
+        'Device VID/PID identification is only supported on',
+        'Failed to get VID/PID of a device on',
+        'Note: Pre-connection option',
+        "Note: It's not possible to reset the chip over a TCP socket",
+        'Deprecated: Command',
+    )
+    if transport == 'socket':
+        pass  # VID/PID socket messages are expected on all transports in CI.
+    warnings: list[str] = []
+    for line in output.splitlines():
+        if 'Warning:' not in line:
+            continue
+        if any(fragment in line for fragment in allowed_fragments):
+            continue
+        warnings.append(line.strip())
+    return warnings
+
+
+def run_flash_id(
+    chip: str,
+    *,
+    port: int | None = None,
+    pty_path: str | None = None,
+    timeout: float = 60.0,
+) -> subprocess.CompletedProcess[str]:
+    if (port is None) == (pty_path is None):
+        raise ValueError('exactly one of port or pty_path is required')
+    esptool_port = pty_path if pty_path is not None else f'socket://localhost:{port}'
+    return run_esptool(
+        '--chip', chip,
+        '--port', esptool_port,
+        '--before', 'no-reset',
+        '--after', 'no-reset',
+        '--no-stub',
+        'flash-id',
+        timeout=timeout,
+    )
+
+
 def _write_flash_ok(result: subprocess.CompletedProcess[str]) -> bool:
     if result.returncode != 0 or 'Wrote' not in result.stdout:
         return False
@@ -181,7 +227,9 @@ __all__ = [
     'esptool_write_flash_at',
     'esptool_write_flash_no_stub',
     'esptool_write_flash_with_stub',
+    'forbidden_warnings',
     'run_esptool',
+    'run_flash_id',
     'write_flash',
     'write_flash_at',
     'write_flash_no_stub',
