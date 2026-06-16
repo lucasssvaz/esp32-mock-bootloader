@@ -9,7 +9,8 @@ setupc.exe runnable with administrator privileges (creates/removes the pair).
 
   python scripts/test_windows_com.py
 
-Override ports with ESP32_MOCK_COM_PORT / ESP32_MOCK_COM_PEER (defaults COM18/COM19).
+Override ports with ESP32_MOCK_SERIAL_BIND / ESP32_MOCK_PORT
+(legacy ESP32_MOCK_COM_PORT / ESP32_MOCK_COM_PEER also work; defaults COM18/COM19).
 """
 
 from __future__ import annotations
@@ -24,8 +25,8 @@ from pathlib import Path
 from esp32_mock_bootloader.com0com import Com0ComError, com0com_pair
 import esp32_mock_bootloader.testing as mock
 
-COM_SERVER = os.environ.get('ESP32_MOCK_COM_PORT', 'COM18')
-COM_PEER = os.environ.get('ESP32_MOCK_COM_PEER', 'COM19')
+COM_BIND = os.environ.get('ESP32_MOCK_SERIAL_BIND') or os.environ.get('ESP32_MOCK_COM_PORT', 'COM18')
+COM_PORT = os.environ.get('ESP32_MOCK_PORT') or os.environ.get('ESP32_MOCK_COM_PEER', 'COM19')
 
 
 def _fail(message: str) -> int:
@@ -38,13 +39,13 @@ def main() -> int:
         return _fail('This script is for Windows with com0com installed.')
 
     try:
-        with com0com_pair(COM_SERVER, COM_PEER) as pair:
+        with com0com_pair(COM_BIND, COM_PORT) as pair:
             return _run_flash_test(pair.server, pair.peer)
     except Com0ComError as exc:
         return _fail(str(exc))
 
 
-def _run_flash_test(com_server: str, com_peer: str) -> int:
+def _run_flash_test(serial_bind: str, client_port: str) -> int:
     with tempfile.TemporaryDirectory() as tmp:
         path_file = Path(tmp) / 'mock-com.path'
         bin_file = Path(tmp) / 'test.bin'
@@ -55,8 +56,7 @@ def _run_flash_test(com_server: str, com_peer: str) -> int:
                 sys.executable, '-m', 'esp32_mock_bootloader.cli', 'run',
                 '--pty',
                 '--pty-path-file', str(path_file),
-                '--com-port', com_server,
-                '--com-peer', com_peer,
+                '--port', client_port,
                 '--chip', 'esp32',
                 '--timeout', '120',
             ],
@@ -75,12 +75,12 @@ def _run_flash_test(com_server: str, com_peer: str) -> int:
             else:
                 return _fail('Timed out waiting for mock COM endpoint file')
 
-            client_port = path_file.read_text(encoding='ascii').strip()
-            if client_port != com_peer:
-                return _fail(f'Expected client port {com_peer}, got {client_port!r}')
+            endpoint = path_file.read_text(encoding='ascii').strip()
+            if endpoint != client_port:
+                return _fail(f'Expected client port {client_port}, got {endpoint!r}')
 
-            print(f'com0com pair {com_server} <-> {com_peer}')
-            print(f'Mock on {com_server}, client port {client_port}')
+            print(f'com0com pair {serial_bind} <-> {client_port}')
+            print(f'Mock on {serial_bind}, client port {client_port}')
 
             flash_id = subprocess.run(
                 [

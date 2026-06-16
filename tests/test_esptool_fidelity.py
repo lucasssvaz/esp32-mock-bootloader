@@ -28,9 +28,7 @@ def test_flash_id_matching_chip_no_protocol_warnings(chip: str):
         mac_line = ':'.join(f'{b:02x}' for b in mac)
         assert mac_line in output
     finally:
-        if proc.poll() is None:
-            proc.terminate()
-            proc.wait(timeout=5)
+        mock.server.stop_subprocess(proc)
 
 
 @pytest.mark.parametrize('chip', ('esp32', 'esp32c3', 'esp8266'))
@@ -57,16 +55,14 @@ def test_flash_id_esptool_auto_detects_fixed_mock(chip: str):
         mac_line = ':'.join(f'{b:02x}' for b in mac)
         assert mac_line in output
     finally:
-        if proc.poll() is None:
-            proc.terminate()
-            proc.wait(timeout=5)
+        mock.server.stop_subprocess(proc)
 
 
 @pytest.mark.transport
 @pytest.mark.parametrize('chip', ('esp32', 'esp32c3'))
 def test_flash_id_pty_no_protocol_warnings(chip: str, tmp_path: Path):
     path_file = tmp_path / 'mock.pty'
-    proc = mock.server.start_pty(path_file, timeout=60.0, chip=chip)
+    proc = mock.server.start_pty(path_file, timeout=30.0, chip=chip, exit_on_disconnect=True)
     try:
         pty_path = mock.server.read_pty_path(path_file)
         result = mock.esptool.run_flash_id(chip, pty_path=pty_path)
@@ -75,6 +71,4 @@ def test_flash_id_pty_no_protocol_warnings(chip: str, tmp_path: Path):
         warns = mock.esptool.forbidden_warnings(output, transport='pty')
         assert warns == [], '\n'.join(warns)
     finally:
-        if proc.poll() is None:
-            proc.terminate()
-            proc.wait(timeout=5)
+        mock.server.stop_subprocess(proc)

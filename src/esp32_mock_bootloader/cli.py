@@ -10,7 +10,7 @@ import json
 import sys
 
 from esp32_mock_bootloader import chips, daemon
-from esp32_mock_bootloader.server import run_pty_server, run_server
+from esp32_mock_bootloader.server import is_serial_port_name, run_pty_server, run_server
 
 CHIP_CHOICES = sorted(chips.PROFILES.keys()) + ['auto']
 
@@ -30,17 +30,20 @@ def _add_chip_port_bind_args(parser: argparse.ArgumentParser) -> None:
 
 def _cmd_run(args: argparse.Namespace) -> int:
     if args.pty:
+        client_port = args.port if is_serial_port_name(args.port) else None
         run_pty_server(
             args.timeout,
             args.pty_path_file,
             args.chip,
             args.state_file,
-            com_port=args.com_port,
-            com_peer=args.com_peer,
+            client_port=client_port,
+            serial_bind=args.serial_bind,
+            exit_on_disconnect=args.exit_on_disconnect,
         )
     else:
         run_server(
-            args.port, args.timeout, args.chip, args.bind, args.state_file,
+            int(args.port), args.timeout, args.chip, args.bind, args.state_file,
+            exit_on_disconnect=args.exit_on_disconnect,
         )
     return 0
 
@@ -130,10 +133,26 @@ def build_parser() -> argparse.ArgumentParser:
         'run',
         help='Run server in the foreground (used internally by start)',
     )
-    _add_chip_port_bind_args(run_p)
+    run_p.add_argument(
+        '--chip', default='auto', choices=CHIP_CHOICES,
+        help='Chip profile for READ_REG / GET_SECURITY_INFO (default: auto)',
+    )
+    run_p.add_argument(
+        '--port', default=str(daemon.DEFAULT_PORT), metavar='PORT',
+        help=(
+            'TCP listen port (default: %(default)s); '
+            'with --pty in null-modem mode, upload client serial port (e.g. COM19)'
+        ),
+    )
+    run_p.add_argument('--bind', default=daemon.DEFAULT_BIND,
+                       help=f'Bind address (default: {daemon.DEFAULT_BIND})')
     run_p.add_argument(
         '--timeout', type=float, default=None,
         help='Exit after N seconds (default: run until interrupted or stopped)',
+    )
+    run_p.add_argument(
+        '--exit-on-disconnect', action='store_true',
+        help='Exit after the first client disconnects (TCP, PTY, and COM)',
     )
     mode = run_p.add_mutually_exclusive_group()
     mode.add_argument('--pty', action='store_true',
@@ -141,12 +160,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument('--pty-path-file',
                        help='Output file for the client port (PTY path, COM name, or socket:// URL)')
     run_p.add_argument(
-        '--com-port',
-        help='Server-side COM port (com0com pair); also ESP32_MOCK_COM_PORT',
-    )
-    run_p.add_argument(
-        '--com-peer',
-        help='Client-side COM port written to --pty-path-file; also ESP32_MOCK_COM_PEER',
+        '--serial-bind',
+        help=(
+            'Mock-side serial port in a null-modem pair (--pty); '
+            'auto-detected from com0com when only --port is set'
+        ),
     )
     run_p.add_argument('--state-file', default=None,
                        help='Update detected_chip in this JSON state file')

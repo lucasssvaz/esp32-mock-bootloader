@@ -35,9 +35,7 @@ def test_get_security_info_auto_before_detection():
         assert data[1] == protocol.ROM_INVALID_MESSAGE
         sock.close()
     finally:
-        if proc.poll() is None:
-            proc.terminate()
-            proc.wait(timeout=5)
+        mock.server.stop_subprocess(proc)
 
 
 def test_read_reg_legacy_deferred_until_chip_evidence():
@@ -51,9 +49,7 @@ def test_read_reg_legacy_deferred_until_chip_evidence():
         assert mock.protocol.parse_response(mock.protocol.slip_decode_frames(raw)[0])[3] == 0
         sock.close()
     finally:
-        if proc.poll() is None:
-            proc.terminate()
-            proc.wait(timeout=5)
+        mock.server.stop_subprocess(proc)
 
 
 def test_get_security_info_explicit_chip():
@@ -68,9 +64,7 @@ def test_get_security_info_explicit_chip():
         assert data[0] != 0
         sock.close()
     finally:
-        if proc.poll() is None:
-            proc.terminate()
-            proc.wait(timeout=5)
+        mock.server.stop_subprocess(proc)
 
 
 def test_get_security_info_modern_chip():
@@ -88,9 +82,7 @@ def test_get_security_info_modern_chip():
         assert data[20:22] == b'\x00\x00'
         sock.close()
     finally:
-        if proc.poll() is None:
-            proc.terminate()
-            proc.wait(timeout=5)
+        mock.server.stop_subprocess(proc)
 
 
 def test_stub_unknown_command_returns_unimplemented(mock_server):

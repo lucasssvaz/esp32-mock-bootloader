@@ -15,7 +15,12 @@ pytest --cov=esp32_mock_bootloader \
   --cov-report=html:reports/htmlcov \
   --cov-report=xml:reports/coverage.xml
 python scripts/check_coverage.py
+python scripts/coverage_gaps.py
 ```
+
+`coverage_gaps.py` prints uncovered **lines and function names** for product
+code (same scope as the baseline — `testing/` omitted). Use
+`reports/htmlcov/index.html` for line-by-line highlighting.
 
 Tests run in parallel by default (`-n auto` in `pyproject.toml`; requires `pytest-xdist` from `.[test]`).
 Subprocess coverage (CLI/daemon tests) requires `patch = ["subprocess"]` in `pyproject.toml` (pytest-cov 7+).
@@ -28,6 +33,7 @@ Outputs:
 | `reports/coverage.xml` | Machine-readable (gitignored) |
 | `reports/htmlcov/` | HTML report (gitignored) |
 | `reports/coverage-summary.json` | Latest run vs baseline (gitignored) |
+| `reports/coverage-gaps.json` | Uncovered lines/functions per module (gitignored) |
 | `reports/coverage-baseline.json` | **Committed** minimum line % thresholds |
 
 ## CI

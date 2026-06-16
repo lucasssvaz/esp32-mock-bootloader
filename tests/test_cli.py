@@ -103,6 +103,18 @@ def test_start_status_stop_round_trip(tmp_path):
     assert daemon.read_state(port, state_dir) is None
 
 
+def test_cli_run_serial_port_flags():
+    from esp32_mock_bootloader.cli import build_parser
+
+    parser = build_parser()
+    args = parser.parse_args([
+        'run', '--pty', '--port', 'COM19', '--serial-bind', 'COM18', '--chip', 'esp32',
+    ])
+    assert args.port == 'COM19'
+    assert args.serial_bind == 'COM18'
+    assert args.pty is True
+
+
 def test_start_refuses_double_start(tmp_path):
     port = mock.server.reserve_tcp_port()
     state_dir = tmp_path / 'daemon-state'

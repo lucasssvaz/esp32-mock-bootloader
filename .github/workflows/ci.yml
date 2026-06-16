@@ -36,15 +36,22 @@ jobs:
       - name: Run tests with coverage
         shell: bash
         run: |
-          pytest --cov=esp32_mock_bootloader \
+          pytest -n auto --cov-config=pyproject.toml \
+            --cov=esp32_mock_bootloader \
             --cov-report=term-missing \
             --cov-report=xml:reports/coverage.xml \
             --cov-report=html:reports/htmlcov \
             -v
 
+      - name: Verify parallel coverage parity
+        if: runner.os == 'Linux'
+        run: python scripts/verify_parallel_coverage.py
+
       - name: Check coverage baseline
         if: runner.os == 'Linux'
-        run: python scripts/check_coverage.py
+        run: |
+          python scripts/check_coverage.py
+          python scripts/coverage_gaps.py --github-summary "$GITHUB_STEP_SUMMARY"
 
       - name: Upload HTML coverage report
         if: always() && runner.os == 'Linux'
@@ -52,6 +59,13 @@ jobs:
         with:
           name: coverage-html
           path: reports/htmlcov/
+
+      - name: Upload coverage gaps report
+        if: always() && runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-gaps
+          path: reports/coverage-gaps.json
 
       - name: Coverage summary
         if: always()

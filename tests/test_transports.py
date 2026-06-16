@@ -95,11 +95,12 @@ def test_pty_path_file_written(tmp_path: Path):
     path_file = tmp_path / 'mock.pty'
     proc = None
     try:
-        proc = mock.server.start_pty(path_file, timeout=30.0, chip='auto')
+        proc = mock.server.start_pty(path_file, timeout=30.0, chip='auto', exit_on_disconnect=True)
         endpoint = mock.server.read_pty_path(path_file)
         assert endpoint
-        if os.environ.get('ESP32_MOCK_COM_PORT'):
-            assert endpoint == os.environ.get('ESP32_MOCK_COM_PEER', 'COM19')
+        if os.environ.get('ESP32_MOCK_SERIAL_BIND') or os.environ.get('ESP32_MOCK_COM_PORT'):
+            peer = os.environ.get('ESP32_MOCK_PORT') or os.environ.get('ESP32_MOCK_COM_PEER', 'COM19')
+            assert endpoint == peer
         elif os.name == 'nt':
             assert endpoint.startswith('socket://')
         else:
@@ -111,21 +112,21 @@ def test_pty_path_file_written(tmp_path: Path):
             sock.close()
     finally:
         if proc is not None and proc.poll() is None:
-            proc.terminate()
-            proc.wait(timeout=5)
+            mock.server.stop_subprocess(proc)
 
 
+@pytest.mark.com0com
 @pytest.mark.skipif(os.name != 'nt', reason='Windows com0com test')
 def test_windows_com0com_esptool():
     """Creates a com0com pair via setupc (requires admin + com0com installed)."""
     from esp32_mock_bootloader.com0com import Com0ComError, com0com_pair
 
-    com_server = os.environ.get('ESP32_MOCK_COM_PORT', 'COM18')
-    com_peer = os.environ.get('ESP32_MOCK_COM_PEER', 'COM19')
+    com_bind = os.environ.get('ESP32_MOCK_SERIAL_BIND') or os.environ.get('ESP32_MOCK_COM_PORT', 'COM18')
+    com_peer = os.environ.get('ESP32_MOCK_PORT') or os.environ.get('ESP32_MOCK_COM_PEER', 'COM19')
     try:
-        with com0com_pair(com_server, com_peer) as pair:
-            os.environ['ESP32_MOCK_COM_PORT'] = pair.server
-            os.environ['ESP32_MOCK_COM_PEER'] = pair.peer
+        with com0com_pair(com_bind, com_peer) as pair:
+            os.environ['ESP32_MOCK_SERIAL_BIND'] = pair.server
+            os.environ['ESP32_MOCK_PORT'] = pair.peer
             with mock.server.running_mock('pty', 'auto', timeout=60.0) as (_proc, _port, endpoint):
                 with tempfile.TemporaryDirectory() as tmp:
                     bin_file = mock.esptool.create_fake_binary(Path(tmp) / 'test.bin', 1024)

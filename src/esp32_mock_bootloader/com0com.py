@@ -128,6 +128,22 @@ def find_pair_id(list_output: str, *port_names: str) -> int | None:
     return None
 
 
+def find_paired_port(port: str) -> str | None:
+    """Return the other end of a com0com pair, or None if unknown."""
+    try:
+        setupc = find_setupc()
+    except Com0ComError:
+        return None
+    listing = run_setupc(setupc, 'list')
+    wanted = port.upper()
+    for _pair_id, cnca, cncb in parse_pairs(listing):
+        if cnca.upper() == wanted:
+            return cncb
+        if cncb.upper() == wanted:
+            return cnca
+    return None
+
+
 def wait_for_ports(*port_names: str, timeout: float = 15.0) -> None:
     deadline = time.monotonic() + timeout
     wanted = {name.upper() for name in port_names}

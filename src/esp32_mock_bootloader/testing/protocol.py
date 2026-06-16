@@ -78,14 +78,35 @@ def parse_response(frame: bytes) -> tuple[int, int, int, int, bytes]:
 def send_and_receive(
     sock: socket.socket | SerialLink, data: bytes, recv_size: int = 4096,
 ) -> bytes:
-    import time
-
     sock.sendall(data)
-    time.sleep(0.1)
+    return _recv_until_idle(sock, recv_size)
+
+
+def _recv_until_idle(
+    sock: socket.socket | SerialLink,
+    recv_size: int,
+    *,
+    idle_sec: float = 0.02,
+) -> bytes:
+    """Accumulate reads until the link is quiet (handles multi-frame replies)."""
+    restore_timeout: float | None = None
+    if isinstance(sock, socket.socket):
+        restore_timeout = sock.gettimeout()
+        sock.settimeout(idle_sec)
+    chunks: list[bytes] = []
     try:
-        return sock.recv(recv_size)
-    except socket.timeout:
-        return b''
+        while True:
+            try:
+                chunk = sock.recv(recv_size)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        if isinstance(sock, socket.socket):
+            sock.settimeout(restore_timeout)
+    return b''.join(chunks)
 
 
 def send_sync(sock: socket.socket | SerialLink) -> None:

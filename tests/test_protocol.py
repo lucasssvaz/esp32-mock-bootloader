@@ -147,9 +147,7 @@ def test_flash_end_second_session(reference_chip):
         assert mock.protocol.minimal_plain_flash(sock2)
         sock2.close()
     finally:
-        if proc.poll() is None:
-            proc.terminate()
-            proc.wait(timeout=5)
+        mock.server.stop_subprocess(proc)
 
 
 def test_flash_defl(mock_server):
@@ -357,9 +355,7 @@ def test_server_timeout(reference_chip):
         assert proc.returncode is not None
         assert 2.5 <= elapsed <= 7.0
     finally:
-        if proc.poll() is None:
-            proc.terminate()
-            proc.wait(timeout=5)
+        mock.server.stop_subprocess(proc)
 
 
 def test_multiple_frames_one_chunk(mock_server):
@@ -401,9 +397,7 @@ def test_explicit_chip_protocol_smoke(chip: str):
         assert mock.protocol.minimal_plain_flash(sock)
         sock.close()
     finally:
-        if proc.poll() is None:
-            proc.terminate()
-            proc.wait(timeout=5)
+        mock.server.stop_subprocess(proc)
 
 
 def test_flash_data_checksum_error(mock_server):

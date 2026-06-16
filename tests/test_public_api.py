@@ -6,7 +6,11 @@
 from __future__ import annotations
 
 import importlib
+import importlib.metadata
 import inspect
+import json
+import subprocess
+import sys
 
 import pytest
 
@@ -85,3 +89,45 @@ def test_server_advanced_import():
 def test_import_paths_documented_in_api_module():
     api = importlib.import_module('esp32_mock_bootloader.api')
     assert hasattr(api, 'MockBootloader')
+
+
+def test_version_fallback_when_not_installed(monkeypatch):
+    import esp32_mock_bootloader
+
+    def boom(_name: str) -> str:
+        raise importlib.metadata.PackageNotFoundError('nope')
+
+    monkeypatch.setattr(importlib.metadata, 'version', boom)
+    importlib.reload(esp32_mock_bootloader)
+    assert esp32_mock_bootloader.__version__ == '0.1.0'
+    importlib.reload(esp32_mock_bootloader)
+
+
+def test_mock_bootloader_port_before_start():
+    mock = MockBootloader(chip='esp32')
+    with pytest.raises(RuntimeError, match='not started'):
+        _ = mock.port
+
+
+def test_mock_bootloader_url_after_stop(tmp_path):
+    state_dir = tmp_path / 'state'
+    mock = MockBootloader(chip='esp32', state_dir=state_dir)
+    mock.start()
+    port = mock.port
+    mock.stop()
+    assert mock.url == daemon.socket_url(port)
+
+
+def test_mock_bootloader_detected_chip(tmp_path):
+    state_dir = tmp_path / 'state'
+    mock = MockBootloader(chip='auto', state_dir=state_dir)
+    mock.start()
+    daemon.write_state(
+        mock.port,
+        {'detected_chip': 'esp32c3', 'chip': 'auto', 'port': mock.port},
+        state_dir,
+    )
+    assert mock.detected_chip == 'esp32c3'
+    mock.stop()
+    assert mock.detected_chip is None
+

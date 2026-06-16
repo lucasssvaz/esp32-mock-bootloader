@@ -140,11 +140,16 @@ Common flags for `start` and `run`:
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--chip` | `auto` | Chip profile, or `auto` to detect from client traffic |
-| `--port` | `9876` | TCP port |
+| `--port` | `9876` | TCP listen port (`run` / `start`); with `run --pty` in null-modem mode, the **upload client** serial port (e.g. `COM19`) — same port you pass to esptool |
+| `--serial-bind` | — | `run --pty` only: mock-side port in a null-modem pair; auto-detected from com0com when only `--port` is set |
+| `--pty` | off | `run` only: serial path mode (Unix PTY, null-modem COM, or Windows socket fallback) |
+| `--pty-path-file` | — | `run --pty`: write the client endpoint here (PTY path, COM name, or `socket://` URL) |
 | `--bind` | `127.0.0.1` | Bind address |
 | `--state-dir` | `~/.cache/esp32-mock-bootloader` | Daemon state and logs |
 | `--startup-timeout` | `30` | Seconds `start` waits for the port (`start` only) |
 | `--force` | off | Stop an existing daemon on the same port first (`start` only) |
+| `--exit-on-disconnect` | off | Exit after the first client disconnects on any transport (`run`; test TCP helpers enable this) |
+| `--timeout` | none | Exit after N seconds (`run` only) |
 
 `status --json` adds machine-readable output. Set `ESP32_MOCK_BOOTLOADER_STATE_DIR` to override the default state directory.
 
@@ -263,19 +268,44 @@ esptool --chip esp32 --port "$(cat /tmp/mock-pty)" write-flash 0x10000 firmware.
 | Windows (local) | com0com virtual COM pair |
 | Windows (CI) | `socket://127.0.0.1:PORT` fallback when no COM pair is configured |
 
+#### PTY vs COM
+
+Both modes expose a **serial device path** to the client, but they create that path differently:
+
+| | **PTY** (Unix default) | **Null-modem serial** (`--port` / `--serial-bind`) |
+|--|------------------------|---------------------------------------|
+| **What it is** | Kernel pseudo-terminal pair created by the mock | Two ends of an existing serial device (virtual or physical) |
+| **Server I/O** | Master side of the PTY (`PtyMasterTransport`) | pyserial on `--serial-bind` |
+| **Client path** | Slave device (e.g. `/dev/ttys003`) | `--port` (e.g. `COM19`); written to `--pty-path-file` |
+| **Typical platform** | Linux / macOS | Windows (com0com); Linux with `socat` loopback |
+| **Needs extra software** | No | Yes on Windows (com0com); paired ports on Linux |
+
+**Null-modem mode is not Windows-only.** Any path pyserial can open works on any OS. Unix CI defaults to PTY because the kernel provides a free pair with no setup.
+
+On Windows with com0com you usually pass only **`--port COM19`** (the upload port). The mock looks up the paired port via `setupc` and binds there automatically. Pass **`--serial-bind COM18`** as well when you want to name both ends explicitly.
+
+Legacy env vars `ESP32_MOCK_COM_PORT` / `ESP32_MOCK_COM_PEER` still work; prefer `ESP32_MOCK_SERIAL_BIND` and `ESP32_MOCK_PORT`.
+
 ### Windows with com0com
 
-Install [com0com](https://sourceforge.net/projects/com0com/). Run the mock on the **server** port; the path file receives the **client** port:
+Install [com0com](https://sourceforge.net/projects/com0com/). The mock binds the paired port; **`--port`** is what esptool uses (written to the path file):
 
 ```bat
 esp32-mock-bootloader run --pty --pty-path-file mock.port ^
-  --com-port COM18 --com-peer COM19 --chip esp32
+  --port COM19 --chip esp32
 esptool --chip esp32 --port COM19 write-flash 0x10000 firmware.bin
+```
+
+To name both ends explicitly:
+
+```bat
+esp32-mock-bootloader run --pty --pty-path-file mock.port ^
+  --serial-bind COM18 --port COM19 --chip esp32
 ```
 
 Expect `Failed to get VID/PID` on com0com ports (see [VID/PID messages](#vidpid-messages)).
 
-Environment variables `ESP32_MOCK_COM_PORT` and `ESP32_MOCK_COM_PEER` work the same as `--com-port` / `--com-peer`.
+Environment variables `ESP32_MOCK_SERIAL_BIND` and `ESP32_MOCK_PORT` work the same as `--serial-bind` / `--port`. Legacy `ESP32_MOCK_COM_PORT` / `ESP32_MOCK_COM_PEER` are still read.
 
 **Helper script** (elevated prompt; creates a pair, runs esptool, removes the pair):
 
@@ -471,17 +501,29 @@ pytest -m "not transport"                     # skip TCP/PTY integration
 pytest tests/test_transports.py             # transport matrix only
 ```
 
-**Coverage** (see [`reports/README.md`](reports/README.md)):
+CI runs the full suite on Ubuntu, Windows, and macOS (parallel via pytest-xdist), enforces coverage baselines on Ubuntu, and verifies parallel subprocess coverage with `scripts/verify_parallel_coverage.py`.
+
+**com0com testing tiers:**
+
+1. **CI (all OS)** — `tests/test_com0com_unit.py` uses `tests/fixtures/fake_setupc.py` (no driver install).
+2. **Windows CI** — `test_windows_com0com_esptool` skips when setupc is missing or not elevated.
+3. **Local Windows** — install com0com, run elevated: `pytest -m com0com` or `scripts/test_windows_com.py`.
 
 ```bash
-pytest --cov=esp32_mock_bootloader \
+pytest -m com0com    # optional real com0com integration (Windows + admin)
+```
+
+**Coverage** (parallel + subprocess children; see [`reports/README.md`](reports/README.md)):
+
+```bash
+pytest -n auto --cov-config=pyproject.toml \
+  --cov=esp32_mock_bootloader \
   --cov-report=term-missing \
   --cov-report=html:reports/htmlcov \
   --cov-report=xml:reports/coverage.xml
+python scripts/verify_parallel_coverage.py
 python scripts/check_coverage.py
 ```
-
-CI runs the full suite on Ubuntu, Windows, and macOS, enforces coverage baselines on Ubuntu, and uploads an HTML report artifact. Windows com0com tests run locally via `scripts/test_windows_com.py`.
 
 **Build a release wheel:**
 

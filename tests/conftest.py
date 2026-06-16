@@ -45,6 +45,10 @@ def pytest_configure(config: pytest.Config) -> None:
         'markers',
         'transport: TCP and PTY transport integration tests',
     )
+    config.addinivalue_line(
+        'markers',
+        'com0com: Windows com0com integration (requires admin + setupc)',
+    )
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
@@ -59,13 +63,11 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 @pytest.fixture
 def mock_server(reference_chip):
     """Yield (port, proc) for a mock server on a unique port."""
-    proc, port = server.start_server(chip=reference_chip)
+    proc, port = server.start_server(chip=reference_chip, exit_on_disconnect=True)
     try:
         yield port, proc
     finally:
-        if proc.poll() is None:
-            proc.terminate()
-            proc.wait(timeout=5)
+        server.stop_subprocess(proc)
 
 
 @pytest.fixture
@@ -74,6 +76,4 @@ def esptool_port(reference_chip):
     try:
         yield port
     finally:
-        if proc.poll() is None:
-            proc.terminate()
-            proc.wait(timeout=5)
+        server.stop_subprocess(proc)

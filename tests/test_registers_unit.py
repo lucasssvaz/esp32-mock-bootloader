@@ -11,6 +11,7 @@ from esptool.loader import ESPLoader
 from esptool.targets import CHIP_DEFS
 
 from esp32_mock_bootloader import registers
+from esp32_mock_bootloader import chips
 
 
 def test_mac_bytes_use_espressif_oui():
@@ -37,6 +38,19 @@ def test_mac_bytes_stable_per_chip():
     c = registers.mac_bytes_for_chip('esp32c3')
     assert a == b
     assert a != c
+
+
+def test_uart_clkdiv_default_crystal_mhz():
+    div = registers.uart_clkdiv_for_chip('esp32c3', crystal_mhz=None)
+    assert div is not None
+
+
+def test_mac_registers_empty_for_unknown_chip():
+    assert registers._mac_registers('not-a-real-chip', (1, 2, 3, 4, 5, 6)) == {}
+
+
+def test_crystal_registers_empty_for_unknown_chip():
+    assert registers._crystal_registers('not-a-real-chip') == {}
 
 
 def test_uart_clkdiv_esp32_26mhz():
@@ -81,3 +95,19 @@ def test_esp32_mac_registers_round_trip():
     efuse2 = profile[base + 8]
     decoded = struct.pack('>II', efuse2, efuse1)[2:]
     assert tuple(decoded) == mac
+
+
+def test_uart_clkdiv_unknown_chip():
+    assert registers.uart_clkdiv_for_chip('not-a-real-chip') is None
+
+
+def test_rom_profile_unknown_chip():
+    assert registers.rom_profile('not-a-real-chip') == {}
+
+
+def test_read_reg_value_detect_magic_short_circuit():
+    chip = 'esp32c3'
+    reg = chips.PROFILES[chip].detect_reg
+    magic = chips.PROFILES[chip].detect_magic
+    assert registers.read_reg_value(chip, reg) == magic
+

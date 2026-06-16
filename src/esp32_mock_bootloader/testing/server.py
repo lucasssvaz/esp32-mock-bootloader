@@ -24,7 +24,7 @@ class SerialLink:
     def __init__(self, port: str) -> None:
         import serial
 
-        self._ser = serial.Serial(port, baudrate=115200, timeout=5.0)
+        self._ser = serial.Serial(port, baudrate=115200, timeout=0.05)
 
     def sendall(self, data: bytes) -> None:
         self._ser.write(data)
@@ -39,6 +39,21 @@ class SerialLink:
         self._ser.close()
 
 
+def stop_subprocess(proc: subprocess.Popen[bytes], *, timeout: float = 5.0) -> None:
+    """Wait for a test server to exit; signal only if it is still running."""
+    if proc.poll() is not None:
+        return
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=timeout)
+
+
 def reserve_tcp_port() -> int:
     """Bind to port 0 and return an ephemeral localhost port."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -51,6 +66,8 @@ def start_server(
     port: int | None = None,
     timeout: float | None = 10.0,
     chip: str = 'auto',
+    *,
+    exit_on_disconnect: bool = False,
 ) -> tuple[subprocess.Popen[bytes], int]:
     """Start mock bootloader subprocess; return (proc, listen_port)."""
     listen_port = port if port is not None else reserve_tcp_port()
@@ -59,6 +76,8 @@ def start_server(
         '--port', str(listen_port),
         '--chip', chip,
     ]
+    if exit_on_disconnect:
+        cmd.append('--exit-on-disconnect')
     if timeout is not None:
         cmd.extend(['--timeout', str(timeout)])
     proc = subprocess.Popen(
@@ -66,7 +85,7 @@ def start_server(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    time.sleep(0.5)
+    time.sleep(0.1)
     return proc, listen_port
 
 
@@ -98,6 +117,8 @@ def start_pty(
     path_file: Path,
     timeout: float | None = 10.0,
     chip: str = 'auto',
+    *,
+    exit_on_disconnect: bool = False,
 ) -> subprocess.Popen[bytes]:
     path_file.parent.mkdir(parents=True, exist_ok=True)
     if path_file.exists():
@@ -107,10 +128,16 @@ def start_pty(
         '--pty', '--pty-path-file', str(path_file),
         '--chip', chip,
     ]
-    com_port = os.environ.get('ESP32_MOCK_COM_PORT')
-    com_peer = os.environ.get('ESP32_MOCK_COM_PEER')
-    if com_port and com_peer:
-        cmd.extend(['--com-port', com_port, '--com-peer', com_peer])
+    if exit_on_disconnect:
+        cmd.append('--exit-on-disconnect')
+    serial_bind = os.environ.get('ESP32_MOCK_SERIAL_BIND') or os.environ.get('ESP32_MOCK_COM_PORT')
+    client_port = os.environ.get('ESP32_MOCK_PORT') or os.environ.get('ESP32_MOCK_COM_PEER')
+    if serial_bind and client_port:
+        cmd.extend(['--serial-bind', serial_bind, '--port', client_port])
+    elif client_port:
+        cmd.extend(['--port', client_port])
+    elif serial_bind:
+        cmd.extend(['--serial-bind', serial_bind])
     if timeout is not None:
         cmd.extend(['--timeout', str(timeout)])
     proc = subprocess.Popen(
@@ -122,12 +149,11 @@ def start_pty(
         if path_file.is_file():
             pty_path = path_file.read_text(encoding='ascii').strip()
             if pty_path:
-                time.sleep(0.5)
                 return proc
         if proc.poll() is not None:
             err = proc.stderr.read().decode() if proc.stderr else ''
             raise RuntimeError(f'PTY mock exited during startup: {err}')
-        time.sleep(0.1)
+        time.sleep(0.02)
     proc.terminate()
     raise TimeoutError(f'PTY path file not created: {path_file}')
 
@@ -168,9 +194,7 @@ def running_server(
     try:
         yield proc, listen_port
     finally:
-        if proc.poll() is None:
-            proc.terminate()
-            proc.wait(timeout=5)
+        stop_subprocess(proc)
 
 
 @contextmanager
@@ -184,25 +208,23 @@ def running_mock(
 ) -> Iterator[tuple[subprocess.Popen[bytes], int | None, str | None]]:
     """Start mock server over TCP or PTY; yield (proc, tcp_port, pty_path)."""
     if transport == 'tcp':
-        proc, tcp_port = start_server(port, timeout=timeout, chip=chip)
+        proc, tcp_port = start_server(
+            port, timeout=timeout, chip=chip, exit_on_disconnect=True,
+        )
         try:
             yield proc, tcp_port, None
         finally:
-            if proc.poll() is None:
-                proc.terminate()
-                proc.wait(timeout=5)
+            stop_subprocess(proc)
         return
 
     pty_file = path_file or Path(tempfile.gettempdir()) / (
         f'esp32-mock-pty-{uuid.uuid4().hex}.path'
     )
-    proc = start_pty(pty_file, timeout=timeout, chip=chip)
+    proc = start_pty(pty_file, timeout=timeout, chip=chip, exit_on_disconnect=True)
     try:
         yield proc, None, read_pty_path(pty_file)
     finally:
-        if proc.poll() is None:
-            proc.terminate()
-            proc.wait(timeout=5)
+        stop_subprocess(proc)
 
 
 def connect_transport(
@@ -235,4 +257,5 @@ __all__ = [
     'start_mock_server',
     'start_pty',
     'start_server',
+    'stop_subprocess',
 ]

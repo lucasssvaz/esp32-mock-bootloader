@@ -28,7 +28,7 @@ Repository = "https://github.com/lucasssvaz/esp32-mock-bootloader"
 Issues = "https://github.com/lucasssvaz/esp32-mock-bootloader/issues"
 
 [project.optional-dependencies]
-test = ["pytest>=8", "pytest-cov>=7", "pytest-xdist>=3"]
+test = ["pytest>=8", "pytest-cov>=7", "pytest-xdist>=3", "coverage>=7.10.6", "pyserial>=3.5"]
 dev = ["hatch", "hatch-vcs", "esp32-mock-bootloader[test]"]
 
 [project.scripts]
@@ -53,6 +53,7 @@ addopts = ["-p", "no:embedded", "-n", "auto"]
 markers = [
     "esptool: integration tests that invoke the esptool CLI",
     "transport: TCP and PTY transport integration tests",
+    "com0com: Windows com0com integration (requires admin + setupc)",
 ]
 testpaths = ["tests"]
 
@@ -65,6 +66,7 @@ data_file = "reports/.coverage"
 parallel = true
 relative_files = true
 patch = ["subprocess"]
+sigterm = true
 
 [tool.coverage.report]
 exclude_lines = [

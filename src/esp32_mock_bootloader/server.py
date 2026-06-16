@@ -21,6 +21,9 @@ from esp32_mock_bootloader import protocol
 from esp32_mock_bootloader import registers
 from esptool.targets import CHIP_DEFS
 
+_CLIENT_RECV_TIMEOUT = 0.05
+_FLASH_END_IDLE_SEC = 3.0
+
 
 class SpiPeripheralMock:
     """Minimal SPI peripheral simulation for esptool flash_id / SFDP probes."""
@@ -560,22 +563,96 @@ def handle_get_security_info(session: ChipSession) -> bytes:
     )
 
 
+class PtyMasterTransport:
+    """Unix PTY master-side I/O for clients that open a device path.
+
+    The kernel reports hangup (EOF on the master) only when every slave
+    reference is closed.  If this process keeps its slave fd open, a client
+    disconnect is invisible.  When *track_disconnect* is set (for
+    ``--exit-on-disconnect``), the server releases its slave fd after the
+    first byte from the client so a later client close becomes a real EOF.
+    """
+
+    def __init__(
+        self,
+        master_fd: int,
+        slave_fd: int,
+        *,
+        track_disconnect: bool = False,
+    ) -> None:
+        self._master = master_fd
+        self._slave = slave_fd
+        self._track_disconnect = track_disconnect
+        self._slave_released = False
+        self._saw_client_data = False
+        self._timeout = _CLIENT_RECV_TIMEOUT
+
+    @classmethod
+    def create(cls, *, track_disconnect: bool = False) -> PtyMasterTransport:
+        import pty
+
+        master, slave = pty.openpty()
+        return cls(master, slave, track_disconnect=track_disconnect)
+
+    @property
+    def client_path(self) -> str:
+        return os.ttyname(self._slave)
+
+    def set_timeout(self, timeout: float) -> None:
+        self._timeout = timeout
+
+    def recv(self, size: int) -> bytes:
+        ready, _, _ = select.select([self._master], [], [], self._timeout)
+        if not ready:
+            raise socket.timeout()
+        chunk = os.read(self._master, size)
+        if chunk:
+            self._on_client_data()
+        return chunk
+
+    def sendall(self, data: bytes) -> None:
+        os.write(self._master, data)
+
+    def close(self) -> None:
+        os.close(self._master)
+        try:
+            os.close(self._slave)
+        except OSError:
+            pass
+
+    def ignore_eof_for_disconnect(self) -> bool:
+        """Whether an empty read should be ignored while waiting for a client."""
+        return self._track_disconnect and not self._saw_client_data
+
+    def _on_client_data(self) -> None:
+        if self._saw_client_data:
+            return
+        self._saw_client_data = True
+        if self._track_disconnect:
+            self._release_slave()
+
+    def _release_slave(self) -> None:
+        if not self._slave_released:
+            os.close(self._slave)
+            self._slave_released = True
+
+
 class BootloaderConnection:
-    """Socket, PTY master fd, or pyserial COM port transport."""
+    """Socket, Unix PTY master, or pyserial serial-port transport."""
 
     def __init__(
         self,
         sock: socket.socket | None = None,
-        master_fd: int | None = None,
+        pty: PtyMasterTransport | None = None,
         serial_port: object | None = None,
     ) -> None:
-        modes = sum(mode is not None for mode in (sock, master_fd, serial_port))
+        modes = sum(mode is not None for mode in (sock, pty, serial_port))
         if modes != 1:
-            raise ValueError('exactly one of sock, master_fd, or serial_port is required')
+            raise ValueError('exactly one of sock, pty, or serial_port is required')
         self._sock = sock
-        self._fd = master_fd
+        self._pty = pty
         self._serial = serial_port
-        self._timeout = 1.0
+        self._timeout = _CLIENT_RECV_TIMEOUT
 
     def set_timeout(self, timeout: float) -> None:
         self._timeout = timeout
@@ -583,19 +660,26 @@ class BootloaderConnection:
             self._sock.settimeout(timeout)
         if self._serial is not None:
             self._serial.timeout = timeout
+        if self._pty is not None:
+            self._pty.set_timeout(timeout)
 
     def recv(self, size: int) -> bytes:
         if self._sock is not None:
             return self._sock.recv(size)
         if self._serial is not None:
-            data = self._serial.read(size)
+            try:
+                data = self._serial.read(size)
+            except Exception as exc:
+                from serial.serialutil import SerialException
+
+                if isinstance(exc, SerialException):
+                    return b''
+                raise
             if not data:
                 raise socket.timeout()
             return data
-        ready, _, _ = select.select([self._fd], [], [], self._timeout)
-        if not ready:
-            raise socket.timeout()
-        return os.read(self._fd, size)
+        assert self._pty is not None
+        return self._pty.recv(size)
 
     def sendall(self, data: bytes) -> None:
         if self._sock is not None:
@@ -603,7 +687,8 @@ class BootloaderConnection:
         elif self._serial is not None:
             self._serial.write(data)
         else:
-            os.write(self._fd, data)
+            assert self._pty is not None
+            self._pty.sendall(data)
 
     def close(self) -> None:
         if self._sock is not None:
@@ -611,13 +696,21 @@ class BootloaderConnection:
         if self._serial is not None:
             self._serial.close()
 
+    def ignore_eof_for_disconnect(self) -> bool:
+        if self._pty is not None:
+            return self._pty.ignore_eof_for_disconnect()
+        return False
+
 
 def handle_client(
     conn: BootloaderConnection,
     stop_event: threading.Event,
     chip_mode: str = 'auto',
     on_detected: Callable[[str | None], None] | None = None,
-) -> None:
+    *,
+    exit_on_disconnect: bool = False,
+) -> bool:
+    """Handle one client session. Returns True if the transport reported disconnect."""
     session = ChipSession(chip_mode)
     if on_detected and session.detected_chip:
         on_detected(session.detected_chip)
@@ -626,24 +719,26 @@ def handle_client(
     flash = FlashImage()
     ram = RamImage()
     flash_ended = False
-    idle_since_flash_end = 0.0
+    flash_end_at = 0.0
+    client_disconnected = False
     try:
-        conn.set_timeout(1.0)
+        conn.set_timeout(_CLIENT_RECV_TIMEOUT)
         while not stop_event.is_set():
-            if flash_ended:
-                if idle_since_flash_end > 3.0:
+            if flash_ended and not exit_on_disconnect:
+                if time.monotonic() - flash_end_at >= _FLASH_END_IDLE_SEC:
                     break
             try:
                 chunk = conn.recv(4096)
             except socket.timeout:
-                if flash_ended:
-                    idle_since_flash_end += 1.0
                 continue
             except OSError:
+                client_disconnected = True
                 break
             if not chunk:
+                if exit_on_disconnect and conn.ignore_eof_for_disconnect():
+                    continue
+                client_disconnected = True
                 break
-            idle_since_flash_end = 0.0
             buf.extend(chunk)
 
             frames = slip_decode_frames(bytes(buf))
@@ -693,6 +788,7 @@ def handle_client(
                 elif cmd == protocol.CMD_FLASH_END:
                     response = make_response(cmd, stub=stub)
                     flash_ended = True
+                    flash_end_at = time.monotonic()
                 elif cmd == protocol.CMD_FLASH_DEFL_BEGIN:
                     flash.begin_defl(data)
                     response = make_response(cmd, stub=stub)
@@ -708,6 +804,7 @@ def handle_client(
                     flash.end_defl()
                     response = make_response(cmd, stub=stub)
                     flash_ended = True
+                    flash_end_at = time.monotonic()
                 elif cmd == protocol.CMD_MEM_BEGIN:
                     ram.begin(data)
                     response = make_response(cmd, stub=stub)
@@ -780,7 +877,8 @@ def handle_client(
                                 buf,
                             )
                         except OSError:
-                            return
+                            client_disconnected = True
+                            break
                         response = b''
                     else:
                         response = make_response(
@@ -792,6 +890,7 @@ def handle_client(
                 elif cmd == protocol.CMD_RUN_USER_CODE:
                     if session.stub_active:
                         flash_ended = True
+                        flash_end_at = time.monotonic()
                         response = b''
                     else:
                         response = make_response(
@@ -809,11 +908,15 @@ def handle_client(
                     try:
                         conn.sendall(response)
                     except OSError:
-                        return
+                        client_disconnected = True
+                        break
+            if client_disconnected:
+                break
     finally:
         if on_detected:
             on_detected(session.detected_chip)
         conn.close()
+    return client_disconnected
 
 
 def _make_on_detected(state_file: str | None) -> Callable[[str | None], None] | None:
@@ -850,6 +953,8 @@ def _tcp_listen_loop(
     chip_mode: str,
     on_detected: Callable[[str | None], None] | None,
     label: str,
+    *,
+    exit_on_disconnect: bool = False,
 ) -> None:
     stop_event = threading.Event()
     srv.settimeout(2.0)
@@ -865,13 +970,16 @@ def _tcp_listen_loop(
             except socket.timeout:
                 continue
             print(f'Connection from {addr}', flush=True)
-            handle_client(
+            disconnected = handle_client(
                 BootloaderConnection(sock=conn),
                 stop_event,
                 chip_mode,
                 on_detected,
+                exit_on_disconnect=exit_on_disconnect,
             )
             print('Client disconnected', flush=True)
+            if exit_on_disconnect and disconnected:
+                break
     except KeyboardInterrupt:
         pass
     finally:
@@ -893,6 +1001,8 @@ def run_server(
     chip_mode: str = 'auto',
     bind: str = '127.0.0.1',
     state_file: str | None = None,
+    *,
+    exit_on_disconnect: bool = False,
 ) -> None:
     on_detected = _make_on_detected(state_file)
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -900,7 +1010,10 @@ def run_server(
     srv.bind((bind, port))
     srv.listen(1)
     label = f'Mock bootloader (chip={chip_mode}) listening on {bind}:{port}'
-    _tcp_listen_loop(srv, timeout, chip_mode, on_detected, label)
+    _tcp_listen_loop(
+        srv, timeout, chip_mode, on_detected, label,
+        exit_on_disconnect=exit_on_disconnect,
+    )
 
 
 def _run_unix_pty_server(
@@ -908,72 +1021,117 @@ def _run_unix_pty_server(
     pty_path_file: str | None,
     chip_mode: str,
     on_detected: Callable[[str | None], None] | None,
+    *,
+    exit_on_disconnect: bool = False,
 ) -> None:
-    import pty
-
-    master, slave = pty.openpty()
-    slave_path = os.ttyname(slave)
-    _write_serial_endpoint(pty_path_file, slave_path)
-    print(f'Mock bootloader (chip={chip_mode}) on PTY {slave_path}', flush=True)
+    pty_transport = PtyMasterTransport.create(track_disconnect=exit_on_disconnect)
+    _write_serial_endpoint(pty_path_file, pty_transport.client_path)
+    print(
+        f'Mock bootloader (chip={chip_mode}) on PTY {pty_transport.client_path}',
+        flush=True,
+    )
     start = time.time()
     try:
         while timeout is None or time.time() - start < timeout:
             stop_event = threading.Event()
-            handle_client(
-                BootloaderConnection(master_fd=master),
+            disconnected = handle_client(
+                BootloaderConnection(pty=pty_transport),
                 stop_event,
                 chip_mode,
                 on_detected,
+                exit_on_disconnect=exit_on_disconnect,
             )
+            if exit_on_disconnect and disconnected:
+                break
     finally:
-        os.close(master)
-        os.close(slave)
+        pty_transport.close()
         if timeout is not None and time.time() - start >= timeout:
             print('Timeout reached, shutting down', flush=True)
     print('Mock bootloader stopped', flush=True)
 
 
-def resolve_com_ports(
-    com_port: str | None = None,
-    com_peer: str | None = None,
+def is_serial_port_name(port: str) -> bool:
+    """True when *port* names a device path rather than a TCP port number."""
+    if port.startswith('/dev/'):
+        return True
+    normalized = port.upper().removeprefix('\\\\.\\')
+    return normalized.startswith('COM')
+
+
+def resolve_serial_pair(
+    client_port: str | None = None,
+    serial_bind: str | None = None,
 ) -> tuple[str, str] | None:
-    """Return (server, client) COM names from args or ESP32_MOCK_COM_* env vars."""
-    server = com_port or os.environ.get('ESP32_MOCK_COM_PORT')
-    client = com_peer or os.environ.get('ESP32_MOCK_COM_PEER')
-    if server and client:
-        return server, client
-    if server or client:
-        raise ValueError('both com port and com peer are required for COM mode')
+    """Return (mock_bind, client_port) for null-modem serial mode, if configured.
+
+    When only one port is given, the paired com0com port is looked up automatically.
+    Legacy env vars ``ESP32_MOCK_COM_PORT`` / ``ESP32_MOCK_COM_PEER`` are still read.
+    """
+    from esp32_mock_bootloader.com0com import find_paired_port
+
+    bind = (
+        serial_bind
+        or os.environ.get('ESP32_MOCK_SERIAL_BIND')
+        or os.environ.get('ESP32_MOCK_COM_PORT')
+    )
+    client = (
+        client_port
+        or os.environ.get('ESP32_MOCK_PORT')
+        or os.environ.get('ESP32_MOCK_COM_PEER')
+    )
+    if bind and client:
+        return bind, client
+    if bind or client:
+        alone = bind or client
+        assert alone is not None
+        peer = find_paired_port(alone)
+        if peer is None:
+            raise ValueError(
+                f'could not find a null-modem pair for serial port {alone!r}; '
+                'pass --serial-bind as well, or use com0com on Windows',
+            )
+        if bind:
+            return bind, peer
+        return peer, alone
     return None
 
 
 def _run_com_server(
-    com_port: str,
-    com_peer: str,
+    serial_bind: str,
+    client_port: str,
     timeout: float | None,
     pty_path_file: str | None,
     chip_mode: str,
     on_detected: Callable[[str | None], None] | None,
+    *,
+    exit_on_disconnect: bool = False,
 ) -> None:
-    """Serve ROM protocol on a COM port (e.g. com0com null-modem pair on Windows)."""
+    """Serve ROM protocol on a serial device path via pyserial.
+
+    Typical use is a Windows com0com null-modem pair, but any OS path that
+    pyserial can open works (e.g. ``/dev/ttyUSB0`` on Linux).
+    """
     import serial
 
-    _write_serial_endpoint(pty_path_file, com_peer)
+    _write_serial_endpoint(pty_path_file, client_port)
     print(
-        f'Mock bootloader (chip={chip_mode}) on {com_port} (client: {com_peer})',
+        f'Mock bootloader (chip={chip_mode}) on {serial_bind} (client: {client_port})',
         flush=True,
     )
-    ser = serial.Serial(com_port, baudrate=115200, timeout=1.0)
+    ser = serial.Serial(serial_bind, baudrate=115200, timeout=_CLIENT_RECV_TIMEOUT)
     start = time.time()
     try:
         while timeout is None or time.time() - start < timeout:
             stop_event = threading.Event()
-            handle_client(
+            disconnected = handle_client(
                 BootloaderConnection(serial_port=ser),
                 stop_event,
                 chip_mode,
                 on_detected,
+                exit_on_disconnect=exit_on_disconnect,
             )
+            if exit_on_disconnect and disconnected:
+                break
     finally:
         ser.close()
         if timeout is not None and time.time() - start >= timeout:
@@ -986,6 +1144,8 @@ def _run_windows_pty_server(
     pty_path_file: str | None,
     chip_mode: str,
     on_detected: Callable[[str | None], None] | None,
+    *,
+    exit_on_disconnect: bool = False,
 ) -> None:
     """CI-friendly fallback when no com0com pair is configured."""
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -998,6 +1158,7 @@ def _run_windows_pty_server(
     _tcp_listen_loop(
         srv, timeout, chip_mode, on_detected,
         f'Mock bootloader (chip={chip_mode}) on {endpoint} (Windows socket fallback)',
+        exit_on_disconnect=exit_on_disconnect,
     )
 
 
@@ -1007,16 +1168,24 @@ def run_pty_server(
     chip_mode: str = 'auto',
     state_file: str | None = None,
     *,
-    com_port: str | None = None,
-    com_peer: str | None = None,
+    client_port: str | None = None,
+    serial_bind: str | None = None,
+    exit_on_disconnect: bool = False,
 ) -> None:
     on_detected = _make_on_detected(state_file)
-    com_pair = resolve_com_ports(com_port, com_peer)
+    com_pair = resolve_serial_pair(client_port, serial_bind)
     if com_pair is not None:
         _run_com_server(
             *com_pair, timeout, pty_path_file, chip_mode, on_detected,
+            exit_on_disconnect=exit_on_disconnect,
         )
     elif os.name == 'nt':
-        _run_windows_pty_server(timeout, pty_path_file, chip_mode, on_detected)
+        _run_windows_pty_server(
+            timeout, pty_path_file, chip_mode, on_detected,
+            exit_on_disconnect=exit_on_disconnect,
+        )
     else:
-        _run_unix_pty_server(timeout, pty_path_file, chip_mode, on_detected)
+        _run_unix_pty_server(
+            timeout, pty_path_file, chip_mode, on_detected,
+            exit_on_disconnect=exit_on_disconnect,
+        )

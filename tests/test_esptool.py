@@ -67,9 +67,7 @@ def test_esptool_write_flash_with_stub_representative_chips(chip: str):
             )
             assert wrote_ok, detail
     finally:
-        if proc.poll() is None:
-            proc.terminate()
-            proc.wait(timeout=5)
+        mock.server.stop_subprocess(proc)
 
 
 def test_esptool_chip_id(esptool_port, reference_chip):
@@ -119,9 +117,7 @@ def test_esptool_multiple_binaries(reference_chip):
                 f'stderr: {result.stderr[-300:]}'
             )
     finally:
-        if proc.poll() is None:
-            proc.terminate()
-            proc.wait(timeout=5)
+        mock.server.stop_subprocess(proc)
 
 
 
@@ -151,9 +147,7 @@ def test_all_esptool_chips_chip_profiles():
             assert mock.protocol.minimal_plain_flash(sock2)
             sock2.close()
         finally:
-            if proc.poll() is None:
-                proc.terminate()
-                proc.wait(timeout=5)
+            mock.server.stop_subprocess(proc)
 
 
 @pytest.mark.parametrize('chip', mock.constants.ESPTOOL_CHIPS)
@@ -167,9 +161,7 @@ def test_esptool_write_flash_all_esptool_chips(chip: str):
             )
             assert wrote_ok, detail
     finally:
-        if proc.poll() is None:
-            proc.terminate()
-            proc.wait(timeout=5)
+        mock.server.stop_subprocess(proc)
 
 
 def _make_old_new_pair(tmp: Path, *, change_first_sector: bool = True) -> tuple[Path, Path]:

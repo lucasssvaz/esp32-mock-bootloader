@@ -34,9 +34,7 @@ def test_auto_legacy_detect_reg_deferred_until_known():
         assert value == 0
         sock.close()
     finally:
-        if proc.poll() is None:
-            proc.terminate()
-            proc.wait(timeout=5)
+        mock.server.stop_subprocess(proc)
 
 
 @pytest.mark.parametrize('chip', chips.chips_with_unique_efuse())
@@ -62,9 +60,7 @@ def test_auto_read_reg_detects_via_unique_efuse(chip: str):
             assert value == profile.detect_magic
         sock.close()
     finally:
-        if proc.poll() is None:
-            proc.terminate()
-            proc.wait(timeout=5)
+        mock.server.stop_subprocess(proc)
 
 
 def test_get_security_info_after_auto_detection():
@@ -87,9 +83,7 @@ def test_get_security_info_after_auto_detection():
         assert data[0] == 0
         sock.close()
     finally:
-        if proc.poll() is None:
-            proc.terminate()
-            proc.wait(timeout=5)
+        mock.server.stop_subprocess(proc)
 
 
 def test_get_security_info_unknown_auto_returns_error():
@@ -105,9 +99,7 @@ def test_get_security_info_unknown_auto_returns_error():
         assert data and data[0] != 0  # error status before detection
         sock.close()
     finally:
-        if proc.poll() is None:
-            proc.terminate()
-            proc.wait(timeout=5)
+        mock.server.stop_subprocess(proc)
 
 
 @pytest.mark.parametrize('chip', mock.constants.ESPTOOL_CHIPS)
@@ -121,9 +113,7 @@ def test_auto_mode_esptool_per_soc(chip: str):
             )
             assert wrote_ok, detail
     finally:
-        if proc.poll() is None:
-            proc.terminate()
-            proc.wait(timeout=5)
+        mock.server.stop_subprocess(proc)
 
 
 @pytest.mark.parametrize('chip', mock.constants.ESPTOOL_CHIPS)
@@ -138,9 +128,7 @@ def test_explicit_chip_detect_register(chip: str):
             assert value == profile.detect_magic
         sock.close()
     finally:
-        if proc.poll() is None:
-            proc.terminate()
-            proc.wait(timeout=5)
+        mock.server.stop_subprocess(proc)
 
 
 def test_daemon_auto_start_detected_chip(tmp_path):
