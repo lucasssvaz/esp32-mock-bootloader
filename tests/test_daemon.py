@@ -10,6 +10,8 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -23,45 +25,38 @@ def test_socket_url_wildcard_bind():
     assert daemon.socket_url(9876, '::') == 'socket://127.0.0.1:9876'
 
 
-def test_read_state_corrupt_json(tmp_path):
-    state_dir = tmp_path / 'state'
-    state_dir.mkdir()
-    path = daemon.state_path(39900, state_dir)
+def test_read_state_corrupt_json():
+    path = daemon.registry_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text('{not json', encoding='utf-8')
-    assert daemon.read_state(39900, state_dir) is None
+    assert daemon.read_state(39900) is None
 
 
-def test_stop_daemon_when_not_running(tmp_path):
-    state_dir = tmp_path / 'state'
-    assert daemon.stop_daemon(39901, state_dir) is False
+def test_stop_daemon_when_not_running():
+    assert daemon.stop_daemon(39901) is False
 
 
-def test_stop_daemon_stale_pid(tmp_path):
-    state_dir = tmp_path / 'state'
-    daemon.write_state(39902, {'pid': 999999, 'port': 39902}, state_dir)
-    assert daemon.stop_daemon(39902, state_dir) is True
-    assert daemon.read_state(39902, state_dir) is None
+def test_stop_daemon_stale_pid():
+    daemon.write_state(39902, {'pid': 999999, 'port': 39902})
+    assert daemon.stop_daemon(39902) is True
+    assert daemon.read_state(39902) is None
 
 
-def test_start_force_replaces_daemon(tmp_path):
+def test_start_force_replaces_daemon():
     port = mock.server.reserve_tcp_port()
-    state_dir = tmp_path / 'state'
     try:
-        first = daemon.start_daemon(port=port, chip_mode='auto', base=state_dir)
-        second = daemon.start_daemon(
-            port=port, chip_mode='esp32', base=state_dir, force=True,
-        )
+        first = daemon.start_daemon(port=port, chip_mode='auto')
+        second = daemon.start_daemon(port=port, chip_mode='esp32', force=True)
         assert first['pid'] != second['pid']
-        status = daemon.daemon_status(port, state_dir)
+        status = daemon.daemon_status(port)
         assert status['running']
         assert status['chip'] == 'esp32'
     finally:
-        daemon.stop_daemon(port, state_dir)
+        daemon.stop_daemon(port)
 
 
-def test_daemon_status_stopped(tmp_path):
-    state_dir = tmp_path / 'state'
-    info = daemon.daemon_status(39904, state_dir)
+def test_daemon_status_stopped():
+    info = daemon.daemon_status(39904)
     assert info['running'] is False
     assert info['pid'] is None
 
@@ -100,26 +95,17 @@ def test_wait_for_port_timeout():
     assert daemon.wait_for_port(59999, timeout=0.2) is False
 
 
-def test_remove_state_missing_file(tmp_path):
-    daemon.remove_state(39999, tmp_path / 'state')
+def test_remove_state_missing_instance():
+    daemon.remove_state(39999)
 
 
-def test_remove_state_os_error(monkeypatch, tmp_path):
-    state_dir = tmp_path / 'state'
-    path = daemon.state_path(39998, state_dir)
-    path.parent.mkdir(parents=True)
-    path.write_text('{}', encoding='utf-8')
-
-    def boom(_self):
-        raise OSError('denied')
-
-    monkeypatch.setattr(type(path), 'unlink', boom, raising=False)
-    daemon.remove_state(39998, state_dir)
+def test_unregister_instance_is_idempotent():
+    daemon.unregister_instance(39998)
+    daemon.unregister_instance(39998)
 
 
-def test_start_daemon_exits_during_startup(tmp_path, monkeypatch):
+def test_start_daemon_exits_during_startup(monkeypatch):
     port = mock.server.reserve_tcp_port()
-    state_dir = tmp_path / 'state'
 
     class DeadProc:
         pid = 424242
@@ -133,12 +119,11 @@ def test_start_daemon_exits_during_startup(tmp_path, monkeypatch):
     monkeypatch.setattr(daemon, '_spawn_detached', lambda *_a, **_k: DeadProc())
     monkeypatch.setattr(daemon, 'wait_for_port', lambda *_a, **_k: False)
     with pytest.raises(RuntimeError, match='exited during startup'):
-        daemon.start_daemon(port=port, chip_mode='auto', base=state_dir, startup_timeout=0.5)
+        daemon.start_daemon(port=port, chip_mode='auto', startup_timeout=0.5)
 
 
-def test_start_daemon_hang_terminates(tmp_path, monkeypatch):
+def test_start_daemon_hang_terminates(monkeypatch):
     port = mock.server.reserve_tcp_port()
-    state_dir = tmp_path / 'state'
 
     class HangProc:
         pid = 424243
@@ -154,14 +139,24 @@ def test_start_daemon_hang_terminates(tmp_path, monkeypatch):
     monkeypatch.setattr(daemon, '_spawn_detached', lambda *_a, **_k: proc)
     monkeypatch.setattr(daemon, 'wait_for_port', lambda *_a, **_k: False)
     with pytest.raises(RuntimeError, match='did not open port'):
-        daemon.start_daemon(port=port, chip_mode='auto', base=state_dir, startup_timeout=0.1)
+        daemon.start_daemon(port=port, chip_mode='auto', startup_timeout=0.1)
     assert proc.terminated
 
 
-def test_spawn_detached_windows_flags(monkeypatch, tmp_path):
-    import pathlib
+def test_terminate_pid_windows_uses_taskkill(monkeypatch):
+    calls: list[list[str]] = []
 
-    monkeypatch.setattr(daemon, 'Path', pathlib.PosixPath)
+    def fake_run(cmd, check=False):
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(daemon.os, 'name', 'nt', raising=False)
+    monkeypatch.setattr(daemon.subprocess, 'run', fake_run)
+    daemon._terminate_pid(424244)
+    assert calls and calls[0][:2] == ['taskkill', '/PID']
+
+
+def test_spawn_detached_windows_flags(monkeypatch, tmp_path):
     monkeypatch.setattr(os, 'name', 'nt')
     monkeypatch.setattr(daemon.subprocess, 'CREATE_NEW_PROCESS_GROUP', 0x200, raising=False)
     monkeypatch.setattr(daemon.subprocess, 'DETACHED_PROCESS', 0x8, raising=False)
@@ -180,28 +175,18 @@ def test_spawn_detached_windows_flags(monkeypatch, tmp_path):
     assert 'creationflags' in captured
 
 
-def test_stop_daemon_windows_taskkill(tmp_path, monkeypatch):
-    import pathlib
-
-    monkeypatch.setattr(daemon, 'Path', pathlib.PosixPath)
-    monkeypatch.setattr(os, 'name', 'nt')
-    state_dir = tmp_path / 'state'
-    daemon.write_state(39905, {'pid': 424244}, state_dir)
+def test_stop_daemon_windows_taskkill(monkeypatch):
+    daemon.write_state(39905, {'pid': 424244, 'port': 39905})
     monkeypatch.setattr(daemon, 'is_pid_running', lambda pid: pid == 424244)
-    calls: list[list[str]] = []
-
-    def fake_run(cmd, check=False):
-        calls.append(list(cmd))
-
-    monkeypatch.setattr(subprocess, 'run', fake_run)
-    assert daemon.stop_daemon(39905, state_dir) is True
-    assert calls and calls[0][:2] == ['taskkill', '/PID']
+    calls: list[int] = []
+    monkeypatch.setattr(daemon, '_terminate_pid', lambda pid: calls.append(pid))
+    assert daemon.stop_daemon(39905) is True
+    assert calls == [424244]
 
 
-def test_stop_daemon_sends_sigterm(tmp_path, monkeypatch):
-    state_dir = tmp_path / 'state'
+def test_stop_daemon_sends_sigterm(monkeypatch):
     pid = 424245
-    daemon.write_state(39906, {'pid': pid, 'port': 39906}, state_dir)
+    daemon.write_state(39906, {'pid': pid, 'port': 39906})
     signals: list[tuple[int, int]] = []
     checks = {'count': 0}
 
@@ -214,65 +199,59 @@ def test_stop_daemon_sends_sigterm(tmp_path, monkeypatch):
 
     monkeypatch.setattr(daemon, 'is_pid_running', fake_is_running)
     monkeypatch.setattr(os, 'kill', fake_kill)
-    assert daemon.stop_daemon(39906, state_dir) is True
+    assert daemon.stop_daemon(39906) is True
     assert signals == [(pid, signal.SIGTERM)]
 
 
-def test_cli_run_pty_smoke(tmp_path):
-    import time
-
-    path_file = tmp_path / 'pty.path'
-    proc = subprocess.Popen(
-        [
-            sys.executable, '-m', 'esp32_mock_bootloader.cli', 'run',
-            '--pty', '--pty-path-file', str(path_file),
-            '--chip', 'esp32',
-            '--timeout', '30',
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+def test_stop_all_daemons():
+    port_a = mock.server.reserve_tcp_port()
+    port_b = mock.server.reserve_tcp_port()
     try:
-        for _ in range(100):
-            if path_file.is_file() and path_file.read_text(encoding='ascii').strip():
-                break
-            if proc.poll() is not None:
-                break
-            time.sleep(0.1)
-        assert path_file.is_file()
-        assert path_file.read_text(encoding='ascii').strip()
+        daemon.start_daemon(port=port_a, chip_mode='auto')
+        daemon.start_daemon(port=port_b, chip_mode='auto')
+        stopped = daemon.stop_all_daemons()
+        assert sorted(stopped) == sorted([port_a, port_b])
+        assert daemon.list_running_daemons() == []
     finally:
-        if proc.poll() is None:
-            mock.server.stop_subprocess(proc)
+        daemon.stop_daemon(port_a)
+        daemon.stop_daemon(port_b)
 
 
+def test_stop_all_daemons_empty():
+    assert daemon.stop_all_daemons() == []
 
-def _cli(*args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [sys.executable, '-m', 'esp32_mock_bootloader.cli', *args],
-        capture_output=True,
-        text=True,
-        timeout=30,
+
+def test_runtime_dir_resolves_env_path(monkeypatch, tmp_path):
+    nested = tmp_path / 'pytest-nested' / 'runtime'
+    monkeypatch.setenv('ESP32_MOCK_BOOTLOADER_STATE_DIR', os.fspath(nested))
+    resolved = daemon.runtime_dir()
+    assert resolved == nested.resolve()
+    assert resolved.is_absolute()
+
+
+def test_runtime_dir_relative_env_uses_system_temp(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv('ESP32_MOCK_BOOTLOADER_STATE_DIR', 'state')
+    resolved = daemon.runtime_dir()
+    assert resolved.is_absolute()
+    assert resolved == Path(tempfile.gettempdir()).resolve() / 'state'
+    assert tmp_path not in resolved.parents
+
+
+def test_runtime_dir_unix_path_without_drive_not_cwd(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(
+        'ESP32_MOCK_BOOTLOADER_STATE_DIR',
+        '/private/var/folders/T/pytest/test_stop_daemon_windows_taskk0/state',
     )
-
-
-def test_cli_start_force(tmp_path):
-    port = mock.server.reserve_tcp_port()
-    state_dir = tmp_path / 'state'
-    try:
-        assert _cli(
-            'start', '--port', str(port), '--chip', 'auto',
-            '--state-dir', str(state_dir),
-        ).returncode == 0
-        replaced = _cli(
-            'start', '--port', str(port), '--chip', 'esp32',
-            '--state-dir', str(state_dir), '--force',
-        )
-        assert replaced.returncode == 0, replaced.stderr
-        status = json.loads(_cli(
-            'status', '--port', str(port), '--state-dir', str(state_dir), '--json',
-        ).stdout)
-        assert status['chip'] == 'esp32'
-    finally:
-        daemon.stop_daemon(port, state_dir)
+    resolved = daemon.runtime_dir()
+    if os.name == 'nt':
+        assert resolved == (
+            Path(tempfile.gettempdir()).resolve()
+            / 'private/var/folders/T/pytest/test_stop_daemon_windows_taskk0/state'
+        ).resolve()
+    else:
+        assert resolved == Path(
+            '/private/var/folders/T/pytest/test_stop_daemon_windows_taskk0/state',
+        ).resolve()
+    assert tmp_path not in resolved.parents

@@ -234,6 +234,12 @@ class FlashImage:
             return b''
         return bytes(self.data[offset:end])
 
+    def reset(self) -> None:
+        self.data[:] = b'\xff' * len(self.data)
+        self._defl_offset = 0
+        self._decompressor = None
+        self._plain_offset = 0
+
     def md5_stub_response(self, payload: bytes, *, stub: bool = False) -> bytes:
         addr, size, _, _ = struct.unpack_from('<IIII', payload, 0)
         digest = hashlib.md5(bytes(self.data[addr:addr + size])).digest()
@@ -270,6 +276,26 @@ class RamImage:
             if 0 <= pos < len(self.data):
                 self.data[pos] = b
         self._offset += len(block)
+
+
+_persistent_flash: FlashImage | None = None
+
+
+def get_flash_image() -> FlashImage:
+    """Return the process-wide mock SPI flash (created on first use)."""
+    global _persistent_flash
+    if _persistent_flash is None:
+        _persistent_flash = FlashImage()
+    return _persistent_flash
+
+
+def reset_flash_image() -> None:
+    """Erase the process-wide mock flash (for tests)."""
+    global _persistent_flash
+    if _persistent_flash is not None:
+        _persistent_flash.reset()
+    else:
+        _persistent_flash = None
 
 
 def checksum_valid(cmd: int, checksum: int, data: bytes) -> bool:
@@ -645,6 +671,8 @@ class BootloaderConnection:
         sock: socket.socket | None = None,
         pty: PtyMasterTransport | None = None,
         serial_port: object | None = None,
+        *,
+        track_disconnect: bool = False,
     ) -> None:
         modes = sum(mode is not None for mode in (sock, pty, serial_port))
         if modes != 1:
@@ -653,6 +681,8 @@ class BootloaderConnection:
         self._pty = pty
         self._serial = serial_port
         self._timeout = _CLIENT_RECV_TIMEOUT
+        self._track_disconnect = track_disconnect
+        self._saw_client_data = False
 
     def set_timeout(self, timeout: float) -> None:
         self._timeout = timeout
@@ -665,7 +695,10 @@ class BootloaderConnection:
 
     def recv(self, size: int) -> bytes:
         if self._sock is not None:
-            return self._sock.recv(size)
+            chunk = self._sock.recv(size)
+            if chunk:
+                self._saw_client_data = True
+            return chunk
         if self._serial is not None:
             try:
                 data = self._serial.read(size)
@@ -677,9 +710,13 @@ class BootloaderConnection:
                 raise
             if not data:
                 raise socket.timeout()
+            self._saw_client_data = True
             return data
         assert self._pty is not None
-        return self._pty.recv(size)
+        chunk = self._pty.recv(size)
+        if chunk:
+            self._saw_client_data = True
+        return chunk
 
     def sendall(self, data: bytes) -> None:
         if self._sock is not None:
@@ -697,9 +734,14 @@ class BootloaderConnection:
             self._serial.close()
 
     def ignore_eof_for_disconnect(self) -> bool:
+        """Ignore peer EOF until real client data arrives (PTY slave not open yet)."""
         if self._pty is not None:
             return self._pty.ignore_eof_for_disconnect()
         return False
+
+    def abort_empty_session(self) -> bool:
+        """True when an empty read should end this accept without a real disconnect."""
+        return self._sock is not None and self._track_disconnect and not self._saw_client_data
 
 
 def handle_client(
@@ -709,6 +751,7 @@ def handle_client(
     on_detected: Callable[[str | None], None] | None = None,
     *,
     exit_on_disconnect: bool = False,
+    flash: FlashImage | None = None,
 ) -> bool:
     """Handle one client session. Returns True if the transport reported disconnect."""
     session = ChipSession(chip_mode)
@@ -716,7 +759,8 @@ def handle_client(
         on_detected(session.detected_chip)
 
     buf = bytearray()
-    flash = FlashImage()
+    if flash is None:
+        flash = get_flash_image()
     ram = RamImage()
     flash_ended = False
     flash_end_at = 0.0
@@ -735,6 +779,8 @@ def handle_client(
                 client_disconnected = True
                 break
             if not chunk:
+                if exit_on_disconnect and conn.abort_empty_session():
+                    break
                 if exit_on_disconnect and conn.ignore_eof_for_disconnect():
                     continue
                 client_disconnected = True
@@ -919,30 +965,17 @@ def handle_client(
     return client_disconnected
 
 
-def _make_on_detected(state_file: str | None) -> Callable[[str | None], None] | None:
-    if not state_file:
+def _make_on_detected(port: int | None) -> Callable[[str | None], None] | None:
+    if port is None:
         return None
 
-    lock = threading.Lock()
+    from esp32_mock_bootloader import daemon
 
     def _update(detected: str | None) -> None:
-        if detected is None:
-            return
-        with lock:
-            try:
-                with open(state_file, encoding='utf-8') as f:
-                    state = json.load(f)
-            except (OSError, json.JSONDecodeError):
-                return
-            if state.get('detected_chip') == detected:
-                return
-            state['detected_chip'] = detected
-            try:
-                with open(state_file, 'w', encoding='utf-8') as f:
-                    json.dump(state, f, indent=2)
-                    f.write('\n')
-            except OSError:
-                pass
+        try:
+            daemon.set_detected_chip(port, detected)
+        except OSError:
+            pass
 
     return _update
 
@@ -971,7 +1004,7 @@ def _tcp_listen_loop(
                 continue
             print(f'Connection from {addr}', flush=True)
             disconnected = handle_client(
-                BootloaderConnection(sock=conn),
+                BootloaderConnection(sock=conn, track_disconnect=exit_on_disconnect),
                 stop_event,
                 chip_mode,
                 on_detected,
@@ -1000,20 +1033,37 @@ def run_server(
     timeout: float | None = None,
     chip_mode: str = 'auto',
     bind: str = '127.0.0.1',
-    state_file: str | None = None,
     *,
     exit_on_disconnect: bool = False,
+    track_registry: bool = False,
 ) -> None:
-    on_detected = _make_on_detected(state_file)
+    from esp32_mock_bootloader import daemon
+
+    on_detected = _make_on_detected(port)
+    if track_registry:
+        daemon.register_instance(port, {
+            'pid': os.getpid(),
+            'port': port,
+            'chip': chip_mode,
+            'bind': bind,
+            'url': daemon.socket_url(port, bind),
+            'log_file': None,
+            'detected_chip': None,
+            'mode': 'foreground',
+        })
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((bind, port))
     srv.listen(1)
     label = f'Mock bootloader (chip={chip_mode}) listening on {bind}:{port}'
-    _tcp_listen_loop(
-        srv, timeout, chip_mode, on_detected, label,
-        exit_on_disconnect=exit_on_disconnect,
-    )
+    try:
+        _tcp_listen_loop(
+            srv, timeout, chip_mode, on_detected, label,
+            exit_on_disconnect=exit_on_disconnect,
+        )
+    finally:
+        if track_registry:
+            daemon.unregister_instance(port)
 
 
 def _run_unix_pty_server(
@@ -1166,13 +1216,12 @@ def run_pty_server(
     timeout: float | None,
     pty_path_file: str | None,
     chip_mode: str = 'auto',
-    state_file: str | None = None,
     *,
     client_port: str | None = None,
     serial_bind: str | None = None,
     exit_on_disconnect: bool = False,
 ) -> None:
-    on_detected = _make_on_detected(state_file)
+    on_detected = _make_on_detected(None)
     com_pair = resolve_serial_pair(client_port, serial_bind)
     if com_pair is not None:
         _run_com_server(

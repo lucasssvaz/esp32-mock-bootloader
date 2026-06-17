@@ -1,11 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Lucas Saavedra Vaz
 # SPDX-License-Identifier: Apache-2.0
 
-"""esptool integration tests (reference client).
-
-Binary sizes (1024, 2048) and pattern bytes (0xAA, 0xBB, …) are arbitrary test data.
-DIFF_FLASH_* constants are documented in ``esp32_mock_bootloader.testing.constants``.
-"""
+"""esptool integration and connect-fidelity tests."""
 
 from __future__ import annotations
 
@@ -241,6 +237,36 @@ def test_esptool_diff_with_identical_sectors_no_stub(esptool_port, reference_chi
         )
         assert second.returncode == 0, second.stderr
         assert 'No changed sectors found' in second.stdout
+        assert 'verified' in second.stdout.lower()
+
+
+def test_esptool_diff_with_identical_sectors_stub(esptool_port, reference_chip):
+    """Second upload with --diff-with skips when daemon flash persists across connections."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        old = mock.esptool.create_pattern_binary(tmp_path / 'old.bin', DIFF_FLASH_SIZE, 0xCE)
+        new = tmp_path / 'new.bin'
+        new.write_bytes(old.read_bytes())
+        first = mock.esptool.write_flash_at(
+            reference_chip,
+            DIFF_FLASH_ADDR,
+            str(old),
+            port=esptool_port,
+            extra_args=('-z',),
+        )
+        assert first.returncode == 0, first.stderr
+        second = mock.esptool.write_flash_at(
+            reference_chip,
+            DIFF_FLASH_ADDR,
+            str(new),
+            port=esptool_port,
+            diff_with=str(old),
+            extra_args=('-z',),
+        )
+        assert second.returncode == 0, second.stderr
+        assert 'No changed sectors found' in second.stdout
+        assert 'verified' in second.stdout.lower()
+        assert 'flashing the whole image' not in second.stdout
 
 
 def test_esptool_diff_with_trust_flash_content_no_stub(esptool_port, reference_chip):
@@ -293,3 +319,63 @@ def test_esptool_diff_with_fallback_full_reflash_no_stub(esptool_port, reference
             or 'Verification failed after fast reflash' in result.stdout
             or 'flashing the whole image' in result.stdout
         )
+pytestmark = pytest.mark.esptool
+
+
+@pytest.mark.parametrize('chip', mock.constants.ESPTOOL_CHIPS)
+def test_flash_id_matching_chip_no_protocol_warnings(chip: str):
+    proc, port = mock.server.start_server(timeout=60.0, chip=chip)
+    try:
+        result = mock.esptool.run_flash_id(chip, port=port)
+        output = result.stdout + result.stderr
+        assert result.returncode == 0, output[-800:]
+        warns = mock.esptool.forbidden_warnings(output, transport='socket')
+        assert warns == [], '\n'.join(warns)
+        mac = registers.mac_bytes_for_chip(chip)
+        mac_line = ':'.join(f'{b:02x}' for b in mac)
+        assert mac_line in output
+    finally:
+        mock.server.stop_subprocess(proc)
+
+
+@pytest.mark.parametrize('chip', ('esp32', 'esp32c3', 'esp8266'))
+def test_flash_id_esptool_auto_detects_fixed_mock(chip: str):
+    """esptool --chip auto uses ROM probes; mock --chip X must match the virtual SoC."""
+    if chip not in mock.constants.ESPTOOL_CHIPS:
+        pytest.skip(f'{chip} not supported by installed esptool')
+    proc, port = mock.server.start_server(timeout=60.0, chip=chip)
+    try:
+        result = mock.esptool.run_esptool(
+            '--chip', 'auto',
+            '--port', f'socket://localhost:{port}',
+            '--before', 'no-reset',
+            '--after', 'no-reset',
+            '--no-stub',
+            'flash-id',
+            timeout=60.0,
+        )
+        output = result.stdout + result.stderr
+        assert result.returncode == 0, output[-800:]
+        warns = mock.esptool.forbidden_warnings(output, transport='socket')
+        assert warns == [], '\n'.join(warns)
+        mac = registers.mac_bytes_for_chip(chip)
+        mac_line = ':'.join(f'{b:02x}' for b in mac)
+        assert mac_line in output
+    finally:
+        mock.server.stop_subprocess(proc)
+
+
+@pytest.mark.transport
+@pytest.mark.parametrize('chip', ('esp32', 'esp32c3'))
+def test_flash_id_pty_no_protocol_warnings(chip: str, tmp_path: Path):
+    path_file = tmp_path / 'mock.pty'
+    proc = mock.server.start_pty(path_file, timeout=30.0, chip=chip, exit_on_disconnect=True)
+    try:
+        pty_path = mock.server.read_pty_path(path_file)
+        result = mock.esptool.run_flash_id(chip, pty_path=pty_path)
+        output = result.stdout + result.stderr
+        assert result.returncode == 0, output[-800:]
+        warns = mock.esptool.forbidden_warnings(output, transport='pty')
+        assert warns == [], '\n'.join(warns)
+    finally:
+        mock.server.stop_subprocess(proc)

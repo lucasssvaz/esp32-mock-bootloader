@@ -23,9 +23,9 @@ SUBSET = [
     'tests/test_protocol.py::test_stub_erase_region',
     'tests/test_protocol.py::test_rom_read_flash_slow',
     'tests/test_protocol.py::test_flash_data_checksum_error',
-    'tests/test_protocol_edge.py::test_mem_data_checksum_error_stub_mode',
-    'tests/test_protocol_edge.py::test_flash_defl_data_checksum_error',
-    'tests/test_protocol_edge.py::test_rom_stub_only_commands_rejected_before_stub',
+    'tests/test_protocol.py::test_mem_data_checksum_error_stub_mode',
+    'tests/test_protocol.py::test_flash_defl_data_checksum_error',
+    'tests/test_protocol.py::test_rom_stub_only_commands_rejected_before_stub',
 ]
 
 MAX_GAP_PCT = 2.0

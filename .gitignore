@@ -12,5 +12,5 @@ venv/
 reports/.coverage*
 htmlcov/
 reports/htmlcov/
-reports/coverage.xml
+reports/coverage*.xml
 reports/coverage-summary.json

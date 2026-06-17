@@ -8,9 +8,10 @@ from __future__ import annotations
 import importlib
 import importlib.metadata
 import inspect
-import json
 import subprocess
 import sys
+
+from pathlib import Path
 
 import pytest
 
@@ -52,8 +53,8 @@ def test_chip_profiles_derived_from_esptool():
         assert chips.PROFILES[chip] == expected, chip
 
 
-def test_mock_bootloader_lifecycle(tmp_path):
-    with MockBootloader(chip='esp32', state_dir=tmp_path / 'state') as mock:
+def test_mock_bootloader_lifecycle(registry_root: Path):
+    with MockBootloader(chip='esp32', registry_dir=registry_root) as mock:
         assert mock.port > 0
         assert mock.url.startswith('socket://')
         assert mock.chip == 'esp32'
@@ -62,7 +63,7 @@ def test_mock_bootloader_lifecycle(tmp_path):
             test_protocol.send_sync(sock)
         finally:
             sock.close()
-    status = daemon.daemon_status(mock.port, tmp_path / 'state')
+    status = daemon.daemon_status(mock.port)
     assert status['running'] is False
 
 
@@ -109,25 +110,18 @@ def test_mock_bootloader_port_before_start():
         _ = mock.port
 
 
-def test_mock_bootloader_url_after_stop(tmp_path):
-    state_dir = tmp_path / 'state'
-    mock = MockBootloader(chip='esp32', state_dir=state_dir)
+def test_mock_bootloader_url_after_stop(registry_root: Path):
+    mock = MockBootloader(chip='esp32', registry_dir=registry_root)
     mock.start()
     port = mock.port
     mock.stop()
     assert mock.url == daemon.socket_url(port)
 
 
-def test_mock_bootloader_detected_chip(tmp_path):
-    state_dir = tmp_path / 'state'
-    mock = MockBootloader(chip='auto', state_dir=state_dir)
+def test_mock_bootloader_detected_chip(registry_root: Path):
+    mock = MockBootloader(chip='auto', registry_dir=registry_root)
     mock.start()
-    daemon.write_state(
-        mock.port,
-        {'detected_chip': 'esp32c3', 'chip': 'auto', 'port': mock.port},
-        state_dir,
-    )
+    daemon.set_detected_chip(mock.port, 'esp32c3', base=registry_root)
     assert mock.detected_chip == 'esp32c3'
     mock.stop()
     assert mock.detected_chip is None
-

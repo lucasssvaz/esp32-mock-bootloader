@@ -23,13 +23,13 @@ class MockBootloader:
         *,
         bind: str = daemon.DEFAULT_BIND,
         startup_timeout: float = daemon.DEFAULT_STARTUP_TIMEOUT,
-        state_dir: Path | None = None,
+        registry_dir: Path | None = None,
     ) -> None:
         self.chip = chip
         self._port = port
         self._bind = bind
         self._startup_timeout = startup_timeout
-        self._state_dir = state_dir
+        self._registry_dir = registry_dir
         self._data: dict[str, Any] | None = None
 
     def start(self) -> MockBootloader:
@@ -40,14 +40,14 @@ class MockBootloader:
             chip_mode=self.chip,
             startup_timeout=self._startup_timeout,
             bind=self._bind,
-            base=self._state_dir,
+            base=self._registry_dir,
             force=True,
         )
         return self
 
     def stop(self) -> None:
         if self._port is not None:
-            daemon.stop_daemon(self._port, self._state_dir)
+            daemon.stop_daemon(self._port, self._registry_dir)
         self._data = None
 
     @property
@@ -64,7 +64,7 @@ class MockBootloader:
 
     @property
     def detected_chip(self) -> str | None:
-        state = daemon.read_state(self.port, self._state_dir)
+        state = daemon.read_state(self.port, self._registry_dir)
         if not state:
             return None
         detected = state.get('detected_chip')

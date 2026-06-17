@@ -120,7 +120,7 @@ esptool --chip esp32 \
 esp32-mock-bootloader stop
 ```
 
-The daemon keeps running between steps 1 and 3. Use `status` to inspect it, or `url` to print the `socket://` address again.
+The daemon keeps running between steps 1 and 3. Use `status` to inspect it, `url` for the full `socket://` address, or `port` for the port number alone.
 
 ## Usage
 
@@ -129,9 +129,11 @@ The daemon keeps running between steps 1 and 3. Use `status` to inspect it, or `
 | Command | Description |
 |---------|-------------|
 | `start` | Start the background daemon and exit once the port is ready |
-| `stop` | Stop the daemon (safe to run if already stopped) |
-| `status` | Show pid, chip mode, detected SoC, and URL (exit 1 if stopped) |
-| `url` | Print `socket://127.0.0.1:PORT` |
+| `stop` | Stops the only running instance by default; `--port PORT` for one; `--port all` for every instance |
+| `status` | Auto-picks the only running instance; lists all when several are running; `--port PORT` or `--port all` |
+| `url` | Prints one `socket://` URL (auto-pick); tab-separated list when several; `--port PORT` or `--port all` |
+| `port` | Prints one TCP port (auto-pick); one per line when several; `--port PORT` or `--port all` |
+| `erase-flash` | Erases the only running instance by default; `--port PORT` or `--port all` |
 | `chips` | List SoCs supported by the installed esptool |
 | `run` | Run the server in the foreground (used internally; prefer `start`) |
 
@@ -145,29 +147,40 @@ Common flags for `start` and `run`:
 | `--pty` | off | `run` only: serial path mode (Unix PTY, null-modem COM, or Windows socket fallback) |
 | `--pty-path-file` | — | `run --pty`: write the client endpoint here (PTY path, COM name, or `socket://` URL) |
 | `--bind` | `127.0.0.1` | Bind address |
-| `--state-dir` | `~/.cache/esp32-mock-bootloader` | Daemon state and logs |
 | `--startup-timeout` | `30` | Seconds `start` waits for the port (`start` only) |
 | `--force` | off | Stop an existing daemon on the same port first (`start` only) |
 | `--exit-on-disconnect` | off | Exit after the first client disconnects on any transport (`run`; test TCP helpers enable this) |
 | `--timeout` | none | Exit after N seconds (`run` only) |
 
-`status --json` adds machine-readable output. Set `ESP32_MOCK_BOOTLOADER_STATE_DIR` to override the default state directory.
+`status --json` adds machine-readable output. With several running instances (or `--port all`), JSON is `{"instances": [...]}`; otherwise a single status object.
+
+`status`, `url`, `port`, `erase-flash`, and `stop` share `--port` semantics: omit it to auto-pick (one instance behaves like before; several are listed or all stopped/erased), pass a number for one instance, or pass `all` to always target every running instance.
+
+When no daemon is running and you omit `--port`, query commands fall back to port `9876` (the `start` default) so `$(esp32-mock-bootloader url)` keeps working in single-daemon CI scripts.
 
 ### Daemon lifecycle
 
-`start` writes state to `{state-dir}/port-{port}.json` and logs to `port-{port}.log`:
+Runtime files live under the OS temp directory (`$TMPDIR/esp32-mock-bootloader/` on macOS/Linux, `%TEMP%\esp32-mock-bootloader\` on Windows). A single `registry.json` tracks every running daemon and foreground `run` process:
 
 ```json
 {
-  "pid": 12345,
-  "port": 9876,
-  "chip": "esp32",
-  "url": "socket://127.0.0.1:9876",
-  "detected_chip": "esp32"
+  "version": 1,
+  "instances": {
+    "9876": {
+      "pid": 12345,
+      "port": 9876,
+      "chip": "esp32",
+      "bind": "127.0.0.1",
+      "url": "socket://127.0.0.1:9876",
+      "log_file": "/tmp/esp32-mock-bootloader/port-9876.log",
+      "detected_chip": "esp32",
+      "mode": "daemon"
+    }
+  }
 }
 ```
 
-`detected_chip` is filled after a client identifies the SoC (in `auto` mode).
+Per-port logs are written alongside the registry. Stale entries are pruned automatically when a process is no longer running. `detected_chip` is filled after a client identifies the SoC (in `auto` mode).
 
 ### Chip selection
 
@@ -505,7 +518,7 @@ CI runs the full suite on Ubuntu, Windows, and macOS (parallel via pytest-xdist)
 
 **com0com testing tiers:**
 
-1. **CI (all OS)** — `tests/test_com0com_unit.py` uses `tests/fixtures/fake_setupc.py` (no driver install).
+1. **CI (all OS)** — `tests/test_transports.py` uses `tests/fixtures/fake_setupc.py` (no driver install).
 2. **Windows CI** — `test_windows_com0com_esptool` skips when setupc is missing or not elevated.
 3. **Local Windows** — install com0com, run elevated: `pytest -m com0com` or `scripts/test_windows_com.py`.
 

@@ -17,6 +17,11 @@ from pathlib import Path
 from typing import Iterator
 from urllib.parse import urlparse
 
+from esp32_mock_bootloader.daemon import wait_for_port
+
+DEFAULT_STARTUP_TIMEOUT = 5.0
+DEFAULT_CONNECT_TIMEOUT = 3.0
+
 
 class SerialLink:
     """Duck-type socket interface for pyserial (PTY client)."""
@@ -39,7 +44,7 @@ class SerialLink:
         self._ser.close()
 
 
-def stop_subprocess(proc: subprocess.Popen[bytes], *, timeout: float = 5.0) -> None:
+def stop_subprocess(proc: subprocess.Popen[bytes], *, timeout: float = 1.0) -> None:
     """Wait for a test server to exit; signal only if it is still running."""
     if proc.poll() is not None:
         return
@@ -68,6 +73,7 @@ def start_server(
     chip: str = 'auto',
     *,
     exit_on_disconnect: bool = False,
+    startup_timeout: float = DEFAULT_STARTUP_TIMEOUT,
 ) -> tuple[subprocess.Popen[bytes], int]:
     """Start mock bootloader subprocess; return (proc, listen_port)."""
     listen_port = port if port is not None else reserve_tcp_port()
@@ -82,10 +88,16 @@ def start_server(
         cmd.extend(['--timeout', str(timeout)])
     proc = subprocess.Popen(
         cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
-    time.sleep(0.1)
+    if not wait_for_port(listen_port, timeout=startup_timeout):
+        exit_code = proc.poll()
+        stop_subprocess(proc)
+        raise RuntimeError(
+            f'mock server did not open port {listen_port} (exit={exit_code})',
+        )
     return proc, listen_port
 
 
@@ -94,20 +106,26 @@ start_mock_server = start_server
 
 
 def connect(
-    port: int, host: str = '127.0.0.1', retries: int = 5,
+    port: int,
+    host: str = '127.0.0.1',
+    timeout: float = DEFAULT_CONNECT_TIMEOUT,
 ) -> socket.socket:
     """Open a TCP connection to a running mock server."""
-    for i in range(retries):
+    deadline = time.time() + timeout
+    delay = 0.05
+    last_err: ConnectionRefusedError | None = None
+    while time.time() < deadline:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(5.0)
-            s.connect((host, port))
-            return s
-        except ConnectionRefusedError:
-            time.sleep(0.3)
-            if i == retries - 1:
-                raise
-    raise ConnectionRefusedError('Could not connect to mock server')
+            sock.settimeout(5.0)
+            sock.connect((host, port))
+            return sock
+        except ConnectionRefusedError as exc:
+            sock.close()
+            last_err = exc
+            time.sleep(delay)
+            delay = min(delay * 1.5, 0.5)
+    raise last_err or ConnectionRefusedError(f'Could not connect to mock server on {host}:{port}')
 
 
 connect_to_server = connect
@@ -142,17 +160,18 @@ def start_pty(
         cmd.extend(['--timeout', str(timeout)])
     proc = subprocess.Popen(
         cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
-    for _ in range(100):
+    deadline = time.time() + DEFAULT_STARTUP_TIMEOUT
+    while time.time() < deadline:
         if path_file.is_file():
             pty_path = path_file.read_text(encoding='ascii').strip()
             if pty_path:
                 return proc
         if proc.poll() is not None:
-            err = proc.stderr.read().decode() if proc.stderr else ''
-            raise RuntimeError(f'PTY mock exited during startup: {err}')
+            raise RuntimeError('PTY mock exited during startup')
         time.sleep(0.02)
     proc.terminate()
     raise TimeoutError(f'PTY path file not created: {path_file}')
