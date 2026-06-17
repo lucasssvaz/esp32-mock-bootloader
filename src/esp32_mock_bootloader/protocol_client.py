@@ -1,16 +1,15 @@
 # SPDX-FileCopyrightText: 2026 Lucas Saavedra Vaz
 # SPDX-License-Identifier: Apache-2.0
 
-"""SLIP protocol helpers for talking to the mock bootloader."""
+"""SLIP protocol client helpers for talking to the mock bootloader."""
 
 from __future__ import annotations
 
 import socket
 import struct
 
-from esp32_mock_bootloader import protocol
-from esp32_mock_bootloader.testing import constants
-from esp32_mock_bootloader.testing.server import SerialLink
+from esp32_mock_bootloader import constants, protocol
+from esp32_mock_bootloader.transport import SerialLink
 
 
 def slip_encode(data: bytes) -> bytes:
@@ -86,15 +85,25 @@ def _recv_until_idle(
     sock: socket.socket | SerialLink,
     recv_size: int,
     *,
-    idle_sec: float = 0.02,
+    idle_sec: float = 0.05,
+    first_timeout: float = 2.0,
 ) -> bytes:
-    """Accumulate reads until the link is quiet (handles multi-frame replies)."""
     restore_timeout: float | None = None
     if isinstance(sock, socket.socket):
         restore_timeout = sock.gettimeout()
-        sock.settimeout(idle_sec)
     chunks: list[bytes] = []
     try:
+        if isinstance(sock, socket.socket):
+            sock.settimeout(first_timeout)
+        try:
+            chunk = sock.recv(recv_size)
+        except socket.timeout:
+            return b''
+        if not chunk:
+            return b''
+        chunks.append(chunk)
+        if isinstance(sock, socket.socket):
+            sock.settimeout(idle_sec)
         while True:
             try:
                 chunk = sock.recv(recv_size)
@@ -122,28 +131,21 @@ def read_reg_value(sock: socket.socket | SerialLink, addr: int) -> int | None:
 
 
 def minimal_plain_flash(sock: socket.socket | SerialLink) -> bool:
-    """Minimal FLASH_BEGIN + one DATA block + END at FLASH_APP_OFFSET."""
     send_sync(sock)
     block_size = 0x100
-    fb = make_command(
-        protocol.CMD_FLASH_BEGIN,
-        struct.pack('<IIII', block_size, 1, block_size, constants.FLASH_APP_OFFSET),
-    )
-    fd = make_command(
-        protocol.CMD_FLASH_DATA,
-        struct.pack('<IIII', block_size, 0, 0, 0) + (b'\xAB' * block_size),
-    )
-    fe = make_command(protocol.CMD_FLASH_END, struct.pack('<I', constants.STAY_IN_LOADER))
-    raw = send_and_receive(sock, fb + fd + fe, 4096)
-    frames = slip_decode_frames(raw)
-    if len(frames) < 3:
-        return False
-    cmds = [parse_response(frame)[1] for frame in frames]
-    return cmds == [protocol.CMD_FLASH_BEGIN, protocol.CMD_FLASH_DATA, protocol.CMD_FLASH_END]
+    for cmd, payload in (
+        (protocol.CMD_FLASH_BEGIN, struct.pack('<IIII', block_size, 1, block_size, constants.FLASH_APP_OFFSET)),
+        (protocol.CMD_FLASH_DATA, struct.pack('<IIII', block_size, 0, 0, 0) + (b'\xAB' * block_size)),
+        (protocol.CMD_FLASH_END, struct.pack('<I', constants.STAY_IN_LOADER)),
+    ):
+        raw = send_and_receive(sock, make_command(cmd, payload))
+        frames = slip_decode_frames(raw)
+        if not frames or parse_response(frames[0])[1] != cmd:
+            return False
+    return True
 
 
 def activate_stub(sock: socket.socket | SerialLink) -> None:
-    """Upload a minimal stub session (MEM_BEGIN/DATA/END + OHAI)."""
     send_sync(sock)
     send_and_receive(
         sock,
@@ -180,7 +182,6 @@ def stub_read_flash(
     packet_size: int | None = None,
     max_in_flight: int = 4,
 ) -> tuple[bytes, bytes]:
-    """Client side of stub READ_FLASH (data packets, cumulative acks, MD5)."""
     if packet_size is None:
         packet_size = protocol.FLASH_SECTOR_SIZE
     sock.sendall(

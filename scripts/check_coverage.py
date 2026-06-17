@@ -34,14 +34,10 @@ def parse_coverage_xml(path: Path) -> dict[str, float]:
         name = package.get('name', '')
         if 'esp32_mock_bootloader' not in name:
             continue
-        if '.testing' in name:
-            continue
         line_rate = float(package.get('line-rate', '0'))
         packages['esp32_mock_bootloader'] = round(line_rate * 100, 1)
         for cls in package.findall('classes/class'):
             filename = cls.get('filename', '')
-            if '/testing/' in filename:
-                continue
             if not filename:
                 continue
             key = _module_key(filename)

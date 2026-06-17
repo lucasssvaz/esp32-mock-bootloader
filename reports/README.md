@@ -1,10 +1,7 @@
 # Test coverage reports
 
 Coverage measures how well the **test suite exercises the mock bootloader
-implementation** (`server`, `cli`, `daemon`, `registers`, …). It does **not**
-include `esp32_mock_bootloader.testing` — that subpackage is integration helper
-code used *by* the tests (and by downstream CI consumers), not the ROM mock
-itself. Helpers are omitted via `omit` in `pyproject.toml`.
+implementation** (`server`, `cli`, `daemon`, `registers`, `session`, …).
 
 ## Local run
 
@@ -19,7 +16,7 @@ python scripts/coverage_gaps.py
 ```
 
 `coverage_gaps.py` prints uncovered **lines and function names** for product
-code (same scope as the baseline — `testing/` omitted). Use
+code (full package). Use
 `reports/htmlcov/index.html` for line-by-line highlighting.
 
 Tests run in parallel by default (`-n auto` in `pyproject.toml`; requires `pytest-xdist` from `.[test]`).
@@ -54,4 +51,4 @@ Baseline shape:
 - **`total`** — project-wide floor for product code.
 - **Per-module floors** — only for large or high-risk modules where a drop would
   not move `total` much (`server`, `registers`, `com0com`, …). Tiny constant
-  modules and `testing/*` are intentionally excluded.
+  Tiny constant-only modules may have no per-module floor in the baseline.

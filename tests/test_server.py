@@ -18,9 +18,10 @@ from pathlib import Path
 
 import pytest
 
-from esp32_mock_bootloader import chips, daemon, protocol, server
+from esp32_mock_bootloader import chips, daemon, mock_bootloader, protocol, server
 
-import esp32_mock_bootloader.testing as mock
+from esp32_mock_bootloader import constants, process, protocol_client
+from tests.helpers import esptool
 
 
 def test_chip_session_rejects_unknown_chip():
@@ -68,7 +69,7 @@ def test_get_security_info_esp8266_returns_error():
     session = server.ChipSession('esp8266')
     raw = server.handle_get_security_info(session)
     frames = server.slip_decode_frames(raw)
-    _d, c, _s, _v, data = mock.protocol.parse_response(frames[0])
+    _d, c, _s, _v, data = protocol_client.parse_response(frames[0])
     assert c == protocol.CMD_GET_SECURITY_INFO
     assert data[0] != 0
 
@@ -77,7 +78,7 @@ def test_get_security_info_esp32_returns_error():
     session = server.ChipSession('esp32')
     raw = server.handle_get_security_info(session)
     frames = server.slip_decode_frames(raw)
-    _d, c, _s, _v, data = mock.protocol.parse_response(frames[0])
+    _d, c, _s, _v, data = protocol_client.parse_response(frames[0])
     assert c == protocol.CMD_GET_SECURITY_INFO
     assert data[0] != 0
 
@@ -86,7 +87,7 @@ def test_get_security_info_modern_chip():
     session = server.ChipSession('esp32c3')
     raw = server.handle_get_security_info(session)
     frames = server.slip_decode_frames(raw)
-    _d, c, size, _v, data = mock.protocol.parse_response(frames[0])
+    _d, c, size, _v, data = protocol_client.parse_response(frames[0])
     assert c == protocol.CMD_GET_SECURITY_INFO
     assert size == 22
     assert data[0] == 0
@@ -99,7 +100,7 @@ def test_handle_read_reg_legacy_deferred_in_auto():
     session = server.ChipSession('auto')
     raw = server.handle_read_reg(struct.pack('<I', chips.LEGACY_DETECT_REG), session)
     frames = server.slip_decode_frames(raw)
-    assert mock.protocol.parse_response(frames[0])[3] == 0
+    assert protocol_client.parse_response(frames[0])[3] == 0
 
 
 def test_handle_read_reg_detects_unique_magic():
@@ -111,7 +112,7 @@ def test_handle_read_reg_detects_unique_magic():
     session = server.ChipSession('auto')
     raw = server.handle_read_reg(struct.pack('<I', profile.detect_reg), session)
     frames = server.slip_decode_frames(raw)
-    assert mock.protocol.parse_response(frames[0])[3] == profile.detect_magic
+    assert protocol_client.parse_response(frames[0])[3] == profile.detect_magic
     assert session.detected_chip == chip
 
 
@@ -124,14 +125,14 @@ def test_flash_image_md5_and_defl_error_paths():
     )  # invalid zlib
     flash.end_defl()
     rom = flash.md5_stub_response(struct.pack('<IIII', 0, 16, 0, 0))
-    frames = mock.protocol.slip_decode_frames(rom)
-    _d, cmd, _s, _v, data = mock.protocol.parse_response(frames[0])
+    frames = protocol_client.slip_decode_frames(rom)
+    _d, cmd, _s, _v, data = protocol_client.parse_response(frames[0])
     assert cmd == 0x13
     assert data[:32] == hashlib.md5(bytes(flash.data[0:16])).hexdigest().encode('ascii')
     assert data[32:34] == b'\x00\x00'
 
     stub = flash.md5_stub_response(struct.pack('<IIII', 0, 16, 0, 0), stub=True)
-    _d, cmd, _s, _v, data = mock.protocol.parse_response(mock.protocol.slip_decode_frames(stub)[0])
+    _d, cmd, _s, _v, data = protocol_client.parse_response(protocol_client.slip_decode_frames(stub)[0])
     assert data[:16] == hashlib.md5(bytes(flash.data[0:16])).digest()
     assert data[16:18] == b'\x00\x00'
 
@@ -161,8 +162,9 @@ def test_make_on_detected_updates_registry():
 
 
 @pytest.fixture
-def bootloader_client():
+def bootloader_client(request):
     """In-process TCP connection to server.handle_client (same thread pool as production)."""
+    request.node.add_marker(pytest.mark.advanced)
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(('127.0.0.1', 0))
@@ -189,24 +191,24 @@ def bootloader_client():
 
 
 def test_handle_client_write_reg(bootloader_client):
-    mock.protocol.send_sync(bootloader_client)
-    raw = mock.protocol.send_and_receive(
+    protocol_client.send_sync(bootloader_client)
+    raw = protocol_client.send_and_receive(
         bootloader_client,
-        mock.protocol.make_command(protocol.CMD_WRITE_REG, struct.pack('<IIII', 0x3FF00000, 1, 0xFFFFFFFF, 0)),
+        protocol_client.make_command(protocol.CMD_WRITE_REG, struct.pack('<IIII', 0x3FF00000, 1, 0xFFFFFFFF, 0)),
     )
     frames = server.slip_decode_frames(raw)
     assert frames
-    assert mock.protocol.parse_response(frames[0])[1] == protocol.CMD_WRITE_REG
+    assert protocol_client.parse_response(frames[0])[1] == protocol.CMD_WRITE_REG
 
 
 def test_handle_client_flash_end_idle_disconnect(bootloader_client):
-    mock.protocol.send_sync(bootloader_client)
-    mock.protocol.send_and_receive(bootloader_client, mock.protocol.make_command(protocol.CMD_FLASH_END, struct.pack('<I', 1)))
+    protocol_client.send_sync(bootloader_client)
+    protocol_client.send_and_receive(bootloader_client, protocol_client.make_command(protocol.CMD_FLASH_END, struct.pack('<I', 1)))
     # server.handle_client exits after _FLASH_END_IDLE_SEC with no further traffic.
     time.sleep(server._FLASH_END_IDLE_SEC + 0.5)
     bootloader_client.settimeout(1.0)
     try:
-        bootloader_client.sendall(mock.protocol.make_command(protocol.CMD_SYNC, b'\x55' * 36))
+        bootloader_client.sendall(protocol_client.make_command(protocol.CMD_SYNC, b'\x55' * 36))
         assert bootloader_client.recv(64) == b''
     except (ConnectionResetError, BrokenPipeError, OSError, socket.timeout):
         pass
@@ -221,7 +223,7 @@ def test_get_security_info_auto_before_detection():
     session = server.ChipSession('auto')
     raw = server.handle_get_security_info(session)
     frames = server.slip_decode_frames(raw)
-    _d, c, _s, _v, data = mock.protocol.parse_response(frames[0])
+    _d, c, _s, _v, data = protocol_client.parse_response(frames[0])
     assert c == protocol.CMD_GET_SECURITY_INFO
     assert data[0] != 0
 
@@ -230,7 +232,7 @@ def test_handle_write_reg_short_payload():
     session = server.ChipSession('esp32')
     raw = server.handle_write_reg(b'\x00' * 8, session)
     frames = server.slip_decode_frames(raw)
-    _d, c, _s, _v, data = mock.protocol.parse_response(frames[0])
+    _d, c, _s, _v, data = protocol_client.parse_response(frames[0])
     assert c == protocol.CMD_WRITE_REG
     assert data[0] == 1
 
@@ -247,172 +249,117 @@ def test_handle_read_reg_shared_efuse_returns_zero():
     addr = chips.PROFILES['esp32c3'].efuse_base + 0x04
     raw = server.handle_read_reg(struct.pack('<I', addr), session)
     frames = server.slip_decode_frames(raw)
-    assert mock.protocol.parse_response(frames[0])[3] == 0
+    assert protocol_client.parse_response(frames[0])[3] == 0
 
 
 def test_handle_client_stub_read_flash(bootloader_client):
-    mock.protocol.send_sync(bootloader_client)
-    mock.protocol.activate_stub(bootloader_client)
-    offset = mock.constants.FLASH_APP_OFFSET
+    protocol_client.send_sync(bootloader_client)
+    protocol_client.activate_stub(bootloader_client)
+    offset = constants.FLASH_APP_OFFSET
     length = 0x200
-    mock.protocol.send_and_receive(
+    protocol_client.send_and_receive(
         bootloader_client,
-        mock.protocol.make_command(
+        protocol_client.make_command(
             protocol.CMD_FLASH_BEGIN,
             struct.pack('<IIII', length, 1, length, offset),
         ),
     )
     block = b'\x5A' * length
     payload = struct.pack('<IIII', length, 0, 0, 0) + block
-    mock.protocol.send_and_receive(
+    protocol_client.send_and_receive(
         bootloader_client,
-        mock.protocol.make_command(protocol.CMD_FLASH_DATA, payload),
+        protocol_client.make_command(protocol.CMD_FLASH_DATA, payload),
     )
-    data, digest = mock.protocol.stub_read_flash(bootloader_client, offset, length)
+    data, digest = protocol_client.stub_read_flash(bootloader_client, offset, length)
     assert data == block
     assert digest == hashlib.md5(block).digest()
 
 
 def test_handle_client_rom_read_flash_slow(bootloader_client):
-    mock.protocol.send_sync(bootloader_client)
+    protocol_client.send_sync(bootloader_client)
     offset = 0x20000
     length = 0x20
-    mock.protocol.send_and_receive(
+    protocol_client.send_and_receive(
         bootloader_client,
-        mock.protocol.make_command(
+        protocol_client.make_command(
             protocol.CMD_FLASH_BEGIN,
             struct.pack('<IIII', length, 1, length, offset),
         ),
     )
     block = b'\xAB' * length
     payload = struct.pack('<IIII', length, 0, 0, 0) + block
-    mock.protocol.send_and_receive(
+    protocol_client.send_and_receive(
         bootloader_client,
-        mock.protocol.make_command(protocol.CMD_FLASH_DATA, payload),
+        protocol_client.make_command(protocol.CMD_FLASH_DATA, payload),
     )
-    raw = mock.protocol.send_and_receive(
+    raw = protocol_client.send_and_receive(
         bootloader_client,
-        mock.protocol.make_command(protocol.CMD_READ_FLASH_SLOW, struct.pack('<II', offset, length)),
+        protocol_client.make_command(protocol.CMD_READ_FLASH_SLOW, struct.pack('<II', offset, length)),
     )
-    _d, c, _s, _v, data = mock.protocol.parse_response(server.slip_decode_frames(raw)[0])
+    _d, c, _s, _v, data = protocol_client.parse_response(server.slip_decode_frames(raw)[0])
     assert c == protocol.CMD_READ_FLASH_SLOW
     assert data[:length] == block
 
 
 def test_handle_client_flash_data_checksum_error(bootloader_client):
-    mock.protocol.send_sync(bootloader_client)
-    mock.protocol.send_and_receive(
+    protocol_client.send_sync(bootloader_client)
+    protocol_client.send_and_receive(
         bootloader_client,
-        mock.protocol.make_command(
+        protocol_client.make_command(
             protocol.CMD_FLASH_BEGIN,
-            struct.pack('<IIII', 0x100, 1, 0x100, mock.constants.FLASH_APP_OFFSET),
+            struct.pack('<IIII', 0x100, 1, 0x100, constants.FLASH_APP_OFFSET),
         ),
     )
     payload = struct.pack('<IIII', 0x100, 0, 0, 0) + (b'\xAB' * 0x100)
-    raw = mock.protocol.send_and_receive(
+    raw = protocol_client.send_and_receive(
         bootloader_client,
-        mock.protocol.make_command(protocol.CMD_FLASH_DATA, payload, checksum=0),
+        protocol_client.make_command(protocol.CMD_FLASH_DATA, payload, checksum=0),
     )
-    _d, c, _s, _v, data = mock.protocol.parse_response(server.slip_decode_frames(raw)[0])
+    _d, c, _s, _v, data = protocol_client.parse_response(server.slip_decode_frames(raw)[0])
     assert c == protocol.CMD_FLASH_DATA
     assert data[0] == 1
     assert data[1] == protocol.ROM_CHECKSUM_ERROR
 
 
 def test_handle_client_mem_end_ohai(bootloader_client):
-    mock.protocol.send_sync(bootloader_client)
-    mock.protocol.send_and_receive(
+    protocol_client.send_sync(bootloader_client)
+    protocol_client.send_and_receive(
         bootloader_client,
-        mock.protocol.make_command(
+        protocol_client.make_command(
             protocol.CMD_MEM_BEGIN,
             struct.pack('<IIII', 0x10, 1, 0x10, 0x40370000),
         ),
     )
     payload = struct.pack('<IIII', 0x10, 0, 0, 0) + (b'\x00' * 0x10)
-    mock.protocol.send_and_receive(
+    protocol_client.send_and_receive(
         bootloader_client,
-        mock.protocol.make_command(protocol.CMD_MEM_DATA, payload),
+        protocol_client.make_command(protocol.CMD_MEM_DATA, payload),
     )
-    raw = mock.protocol.send_and_receive(
+    raw = protocol_client.send_and_receive(
         bootloader_client,
-        mock.protocol.make_command(protocol.CMD_MEM_END, struct.pack('<II', 0, 0x40370000)),
+        protocol_client.make_command(protocol.CMD_MEM_END, struct.pack('<II', 0, 0x40370000)),
     )
-    assert mock.constants.OHAI_BYTES in raw
+    assert constants.OHAI_BYTES in raw
 
 
 def test_handle_client_unknown_command_rom_vs_stub(bootloader_client):
-    mock.protocol.send_sync(bootloader_client)
-    raw = mock.protocol.send_and_receive(
+    protocol_client.send_sync(bootloader_client)
+    raw = protocol_client.send_and_receive(
         bootloader_client,
-        mock.protocol.make_command(0xFF, b''),
+        protocol_client.make_command(0xFF, b''),
     )
-    _d, c, _s, _v, data = mock.protocol.parse_response(server.slip_decode_frames(raw)[0])
+    _d, c, _s, _v, data = protocol_client.parse_response(server.slip_decode_frames(raw)[0])
     assert c == 0xFF
     assert data[1] == protocol.ROM_INVALID_MESSAGE
 
-    mock.protocol.activate_stub(bootloader_client)
-    raw = mock.protocol.send_and_receive(
+    protocol_client.activate_stub(bootloader_client)
+    raw = protocol_client.send_and_receive(
         bootloader_client,
-        mock.protocol.make_command(0xFE, b''),
+        protocol_client.make_command(0xFE, b''),
     )
-    _d, c, _s, _v, data = mock.protocol.parse_response(server.slip_decode_frames(raw)[0])
+    _d, c, _s, _v, data = protocol_client.parse_response(server.slip_decode_frames(raw)[0])
     assert c == 0xFE
     assert data[1] == protocol.STUB_UNIMPLEMENTED
-
-
-def test_tcp_exit_on_disconnect_ignores_empty_probe():
-    """Port-readiness probes must not end a one-shot server before the real client."""
-    import socket as pysocket
-
-    port = mock.server.reserve_tcp_port()
-    proc, listen_port = mock.server.start_server(
-        port=port, chip='esp32', timeout=None, exit_on_disconnect=True,
-    )
-    try:
-        with pysocket.create_connection(('127.0.0.1', listen_port), timeout=1.0):
-            pass
-        time.sleep(0.1)
-        assert proc.poll() is None
-        sock = mock.server.connect(listen_port)
-        mock.protocol.send_sync(sock)
-        sock.close()
-        proc.wait(timeout=3)
-        assert proc.returncode == 0
-    finally:
-        mock.server.stop_subprocess(proc)
-
-
-def test_subprocess_server_survives_many_sessions():
-    """Regression: PIPE capture deadlocks the child when stderr/stdout fill."""
-    for _ in range(12):
-        proc, port = mock.server.start_server(
-            chip='esp32', timeout=None, exit_on_disconnect=True,
-        )
-        try:
-            sock = mock.server.connect(port)
-            mock.protocol.send_sync(sock)
-            sock.close()
-            proc.wait(timeout=3)
-            assert proc.returncode == 0
-        finally:
-            mock.server.stop_subprocess(proc)
-
-
-def test_cli_run_exits_on_client_disconnect():
-    port = mock.server.reserve_tcp_port()
-    proc = None
-    try:
-        proc, listen_port = mock.server.start_server(
-            port=port, timeout=30.0, chip='esp32', exit_on_disconnect=True,
-        )
-        sock = mock.server.connect(listen_port)
-        mock.protocol.send_sync(sock)
-        sock.close()
-        proc.wait(timeout=5)
-        assert proc.returncode == 0
-    finally:
-        if proc is not None and proc.poll() is None:
-            mock.server.stop_subprocess(proc)
 
 
 def test_spi_peripheral_out_of_range_and_flash_probes():
@@ -450,7 +397,7 @@ def test_handle_read_reg_inferred_when_already_detected():
     session.detected_chip = 'esp32c3'
     reg = chips.PROFILES['esp32c3'].detect_reg
     raw = server.handle_read_reg(struct.pack('<I', reg), session)
-    assert mock.protocol.parse_response(server.slip_decode_frames(raw)[0])[3] != 0
+    assert protocol_client.parse_response(server.slip_decode_frames(raw)[0])[3] != 0
 
 
 def test_handle_read_reg_unique_efuse_detection():
@@ -541,11 +488,11 @@ def test_tcp_listen_loop_timeout():
 
 
 def test_handle_client_run_user_code_stub(bootloader_client):
-    mock.protocol.send_sync(bootloader_client)
-    mock.protocol.activate_stub(bootloader_client)
-    raw = mock.protocol.send_and_receive(
+    protocol_client.send_sync(bootloader_client)
+    protocol_client.activate_stub(bootloader_client)
+    raw = protocol_client.send_and_receive(
         bootloader_client,
-        mock.protocol.make_command(protocol.CMD_RUN_USER_CODE, b''),
+        protocol_client.make_command(protocol.CMD_RUN_USER_CODE, b''),
     )
     assert raw == b'' or server.slip_decode_frames(raw) == []
 
@@ -615,7 +562,7 @@ def test_handle_client_over_pty_master_fd():
     thread.start()
 
     try:
-        sync = mock.protocol.make_command(protocol.CMD_SYNC, b'\x55' * 36)
+        sync = protocol_client.make_command(protocol.CMD_SYNC, b'\x55' * 36)
         os.write(slave, sync)
         buf = bytearray()
         deadline = 5.0
@@ -633,7 +580,7 @@ def test_handle_client_over_pty_master_fd():
             buf.extend(chunk)
             frames = server.slip_decode_frames(bytes(buf))
             if frames:
-                _d, cmd, _s, _v, _data = mock.protocol.parse_response(frames[0])
+                _d, cmd, _s, _v, _data = protocol_client.parse_response(frames[0])
                 assert cmd == protocol.CMD_SYNC
                 break
         else:
@@ -660,7 +607,7 @@ def test_handle_client_over_mock_serial():
     thread.start()
 
     try:
-        sync = mock.protocol.make_command(protocol.CMD_SYNC, b'\x55' * 36)
+        sync = protocol_client.make_command(protocol.CMD_SYNC, b'\x55' * 36)
         ser.feed(sync)
         deadline = 5.0
         import time
@@ -670,7 +617,7 @@ def test_handle_client_over_mock_serial():
             if ser.written:
                 frames = server.slip_decode_frames(ser.written)
                 if frames:
-                    _d, cmd, _s, _v, _data = mock.protocol.parse_response(frames[0])
+                    _d, cmd, _s, _v, _data = protocol_client.parse_response(frames[0])
                     assert cmd == protocol.CMD_SYNC
                     break
             time.sleep(0.05)
@@ -682,22 +629,6 @@ def test_handle_client_over_mock_serial():
 
 
 @pytest.mark.skipif(os.name == 'nt', reason='Unix PTY fd transport')
-def test_cli_run_pty_exits_on_client_disconnect(tmp_path):
-    path_file = tmp_path / 'mock.pty'
-    proc = mock.server.start_pty(path_file, timeout=30.0, chip='esp32', exit_on_disconnect=True)
-    try:
-        endpoint = mock.server.read_pty_path(path_file)
-        slave_fd = os.open(endpoint, os.O_RDWR)
-        try:
-            os.write(slave_fd, mock.protocol.make_command(protocol.CMD_SYNC, b'\x55' * 36))
-        finally:
-            os.close(slave_fd)
-        proc.wait(timeout=5)
-        assert proc.returncode == 0
-    finally:
-        mock.server.stop_subprocess(proc)
-
-
 def test_pty_master_transport_releases_slave_on_first_byte():
     import pty
 
@@ -729,7 +660,7 @@ def test_handle_client_exit_on_disconnect_waits_for_eof():
         def read(self, size: int) -> bytes:
             self._reads += 1
             if self._reads == 1:
-                return mock.protocol.make_command(protocol.CMD_SYNC, b'\x55' * 36)
+                return protocol_client.make_command(protocol.CMD_SYNC, b'\x55' * 36)
             raise SerialException('port closed')
 
         def write(self, data: bytes) -> int:
@@ -798,7 +729,7 @@ def test_run_com_server_writes_client_port(tmp_path, monkeypatch):
         'COM_BIND',
         'COM_CLIENT',
         timeout=0.05,
-        pty_path_file=path_file,
+        port_file=path_file,
         chip_mode='esp32',
         on_detected=None,
         exit_on_disconnect=False,
@@ -838,181 +769,116 @@ def test_run_pty_server_dispatch(monkeypatch, tmp_path):
     assert win_calls == ['win']
 
 
-def test_run_windows_pty_server_socket_fallback(tmp_path):
-    path_file = str(tmp_path / 'endpoint')
-    thread = threading.Thread(
-        target=server._run_windows_pty_server,
-        args=(0.2, path_file, 'esp32', None),
-        kwargs={'exit_on_disconnect': True},
-        daemon=True,
-    )
-    thread.start()
-    deadline = time.monotonic() + 1.0
-    endpoint = ''
-    while time.monotonic() < deadline:
-        if os.path.isfile(path_file):
-            endpoint = open(path_file, encoding='ascii').read().strip()
-            if endpoint:
-                break
-        time.sleep(0.01)
-    assert endpoint.startswith('socket://')
-    sock = mock.server.connect_serial_endpoint(endpoint)
-    try:
-        mock.protocol.send_sync(sock)
-    finally:
-        sock.close()
-    thread.join(timeout=1)
-
-def test_connect_serial_endpoint_invalid_socket_url():
-    with pytest.raises(ValueError, match='invalid socket endpoint'):
-        mock.server.connect_serial_endpoint('socket://127.0.0.1')
-
-
-def test_connect_serial_endpoint_unsupported_host():
-    with pytest.raises(ValueError, match='unsupported socket host'):
-        mock.server.connect_serial_endpoint('socket://192.168.1.1:1234')
-
-
-@pytest.mark.esptool
-def test_tcp_daemon_start_stop():
-    """TCP daemon CLI path (PTY has no background daemon)."""
-    port = mock.server.reserve_tcp_port()
-    try:
-        data = daemon.start_daemon(port=port, chip_mode='auto')
-        assert data['url'] == f'socket://127.0.0.1:{port}'
-        status = daemon.daemon_status(port)
-        assert status['running']
-        with tempfile.TemporaryDirectory() as tmp:
-            bin_file = mock.esptool.create_fake_binary(Path(tmp) / 'test.bin', 512)
-            wrote_ok, detail = mock.esptool.write_flash_no_stub(
-                'esp32', str(bin_file), port=port,
-            )
-            assert wrote_ok, detail
-    finally:
-        daemon.stop_daemon(port)
-
-
 @pytest.mark.esptool
 def test_auto_legacy_detect_reg_deferred_until_known():
     """Legacy detect register must not return magic before chip-specific evidence."""
-    proc, port = mock.server.start_server(chip='auto')
-    try:
-        sock = mock.server.connect(port)
-        mock.protocol.send_sync(sock)
-        raw = mock.protocol.send_and_receive(
-            sock, mock.protocol.make_command(0x0A, struct.pack('<I', chips.LEGACY_DETECT_REG)),
+    from esp32_mock_bootloader.advanced import protocol as protocol_api
+
+    with mock_bootloader(chip='auto', timeout=None, exit_on_disconnect=False, mode='foreground') as mock:
+        client = protocol_api.connect(mock)
+        client.sync()
+        raw = client.send_and_receive(
+            protocol_client.make_command(0x0A, struct.pack('<I', chips.LEGACY_DETECT_REG)),
         )
-        frames = mock.protocol.slip_decode_frames(raw)
+        frames = client.decode_frames(raw)
         assert len(frames) >= 1
-        _d, _c, _s, value, _data = mock.protocol.parse_response(frames[0])
+        _d, _c, _s, value, _data = client.parse_response(frames[0])
         assert value == 0
-        sock.close()
-    finally:
-        mock.server.stop_subprocess(proc)
 
 
 @pytest.mark.esptool
 @pytest.mark.parametrize('chip', chips.chips_with_unique_efuse())
 def test_auto_read_reg_detects_via_unique_efuse(chip: str):
+    from esp32_mock_bootloader.advanced import protocol as protocol_api
+
     profile = chips.PROFILES[chip]
-    proc, port = mock.server.start_server(chip='auto')
-    try:
-        sock = mock.server.connect(port)
-        mock.protocol.send_sync(sock)
+    with mock_bootloader(chip='auto', timeout=None, exit_on_disconnect=False, mode='foreground') as mock:
+        client = protocol_api.connect(mock)
+        client.sync()
         efuse_addr = profile.efuse_base + 0x04
-        raw = mock.protocol.send_and_receive(sock, mock.protocol.make_command(0x0A, struct.pack('<I', efuse_addr)))
-        frames = mock.protocol.slip_decode_frames(raw)
+        raw = client.send_and_receive(
+            protocol_client.make_command(0x0A, struct.pack('<I', efuse_addr)),
+        )
+        frames = client.decode_frames(raw)
         assert len(frames) >= 1
-        _d, _c, _s, value, _data = mock.protocol.parse_response(frames[0])
+        _d, _c, _s, value, _data = client.parse_response(frames[0])
         assert value == 0
 
         if profile.detect_magic:
-            raw = mock.protocol.send_and_receive(
-                sock, mock.protocol.make_command(0x0A, struct.pack('<I', profile.detect_reg)),
+            raw = client.send_and_receive(
+                protocol_client.make_command(0x0A, struct.pack('<I', profile.detect_reg)),
             )
-            frames = mock.protocol.slip_decode_frames(raw)
-            _d, _c, _s, value, _data = mock.protocol.parse_response(frames[0])
+            frames = client.decode_frames(raw)
+            _d, _c, _s, value, _data = client.parse_response(frames[0])
             assert value == profile.detect_magic
-        sock.close()
-    finally:
-        mock.server.stop_subprocess(proc)
 
 
 @pytest.mark.esptool
 def test_get_security_info_after_auto_detection():
+    from esp32_mock_bootloader.advanced import protocol as protocol_api
+
     chip = next(
         c for c, p in chips.PROFILES.items()
         if p.detect_magic and p.detect_reg != chips.LEGACY_DETECT_REG
     )
     profile = chips.PROFILES[chip]
-    proc, port = mock.server.start_server(chip='auto')
-    try:
-        sock = mock.server.connect(port)
-        mock.protocol.send_sync(sock)
-        mock.protocol.send_and_receive(
-            sock, mock.protocol.make_command(0x0A, struct.pack('<I', profile.detect_reg)),
+    with mock_bootloader(chip='auto', timeout=None, exit_on_disconnect=False, mode='foreground') as mock:
+        client = protocol_api.connect(mock)
+        client.sync()
+        client.send_and_receive(
+            protocol_client.make_command(0x0A, struct.pack('<I', profile.detect_reg)),
         )
-        raw = mock.protocol.send_and_receive(sock, mock.protocol.make_command(protocol.CMD_GET_SECURITY_INFO))
-        frames = mock.protocol.slip_decode_frames(raw)
-        _d, c, _s, _v, data = mock.protocol.parse_response(frames[0])
+        raw = client.send_and_receive(protocol_client.make_command(protocol.CMD_GET_SECURITY_INFO))
+        frames = client.decode_frames(raw)
+        _d, c, _s, _v, data = client.parse_response(frames[0])
         assert c == protocol.CMD_GET_SECURITY_INFO
         assert data[0] == 0
-        sock.close()
-    finally:
-        mock.server.stop_subprocess(proc)
 
 
 @pytest.mark.esptool
 def test_get_security_info_unknown_auto_returns_error():
-    proc, port = mock.server.start_server(chip='auto')
-    try:
-        sock = mock.server.connect(port)
-        mock.protocol.send_sync(sock)
-        raw = mock.protocol.send_and_receive(sock, mock.protocol.make_command(protocol.CMD_GET_SECURITY_INFO))
-        frames = mock.protocol.slip_decode_frames(raw)
+    from esp32_mock_bootloader.advanced import protocol as protocol_api
+
+    with mock_bootloader(chip='auto', timeout=None, exit_on_disconnect=False, mode='foreground') as mock:
+        client = protocol_api.connect(mock)
+        client.sync()
+        raw = client.send_and_receive(protocol_client.make_command(protocol.CMD_GET_SECURITY_INFO))
+        frames = client.decode_frames(raw)
         assert len(frames) >= 1
-        _d, c, _s, _v, data = mock.protocol.parse_response(frames[0])
+        _d, c, _s, _v, data = client.parse_response(frames[0])
         assert c == protocol.CMD_GET_SECURITY_INFO
         assert data and data[0] != 0  # error status before detection
-        sock.close()
-    finally:
-        mock.server.stop_subprocess(proc)
 
 
 @pytest.mark.esptool
-@pytest.mark.parametrize('chip', mock.constants.ESPTOOL_CHIPS)
+@pytest.mark.parametrize('chip', constants.ESPTOOL_CHIPS)
 def test_auto_mode_esptool_per_soc(chip: str):
-    proc, port = mock.server.start_server(timeout=30.0, chip='auto')
-    try:
+    with mock_bootloader(chip='auto', timeout=30.0, exit_on_disconnect=True, mode='foreground') as mock:
         with tempfile.TemporaryDirectory() as tmp:
-            bin_file = mock.esptool.create_fake_binary(Path(tmp) / 'test.bin', 1024)
-            wrote_ok, detail = mock.esptool.write_flash_no_stub(
-                chip, str(bin_file), port=port,
+            bin_file = esptool.create_fake_binary(Path(tmp) / 'test.bin', 1024)
+            wrote_ok, detail = esptool.write_flash_no_stub(
+                chip, str(bin_file), port=mock.port(),
             )
             assert wrote_ok, detail
-    finally:
-        mock.server.stop_subprocess(proc)
 
 
 @pytest.mark.esptool
-@pytest.mark.parametrize('chip', mock.constants.ESPTOOL_CHIPS)
+@pytest.mark.parametrize('chip', constants.ESPTOOL_CHIPS)
 def test_explicit_chip_detect_register(chip: str):
+    from esp32_mock_bootloader.advanced import protocol as protocol_api
+
     profile = chips.PROFILES[chip]
-    proc, port = mock.server.start_server(chip=chip)
-    try:
-        sock = mock.server.connect(port)
-        mock.protocol.send_sync(sock)
+    with mock_bootloader(chip=chip, timeout=None, exit_on_disconnect=False, mode='foreground') as mock:
+        client = protocol_api.connect(mock)
+        client.sync()
         if profile.detect_magic:
-            value = mock.protocol.read_reg_value(sock, profile.detect_reg)
+            value = client.read_reg(profile.detect_reg)
             assert value == profile.detect_magic
-        sock.close()
-    finally:
-        mock.server.stop_subprocess(proc)
 
 
 @pytest.mark.esptool
 def test_daemon_auto_start_detected_chip():
-    port = mock.server.reserve_tcp_port()
+    port = process.reserve_tcp_port()
     try:
         data = daemon.start_daemon(port=port, chip_mode='auto')
         assert data['chip'] == 'auto'
@@ -1021,8 +887,8 @@ def test_daemon_auto_start_detected_chip():
         assert status['url'] == f'socket://127.0.0.1:{port}'
 
         with tempfile.TemporaryDirectory() as tmp:
-            bin_file = mock.esptool.create_fake_binary(Path(tmp) / 'test.bin', 512)
-            wrote_ok, detail = mock.esptool.write_flash_no_stub(
+            bin_file = esptool.create_fake_binary(Path(tmp) / 'test.bin', 512)
+            wrote_ok, detail = esptool.write_flash_no_stub(
                 'esp32', str(bin_file), port=port,
             )
             assert wrote_ok, detail

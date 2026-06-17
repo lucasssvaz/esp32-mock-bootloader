@@ -20,9 +20,9 @@ Bug reports and feature requests are welcome via [GitHub Issues](https://github.
 
 ### Import conventions
 
-- **Package root** (`from esp32_mock_bootloader import …`): only `MockBootloader` and `__version__`.
+- **Package root** (`from esp32_mock_bootloader import …`): only `mock_bootloader`, `MockHandle`, `instances`, and `__version__`.
 - **Submodules**: import the module, then use attributes — e.g. `chips.PROFILES`, `protocol.CMD_SYNC`, `mock.server.connect(port)`.
-- Do not add long re-export lists to `__init__.py`. Put `__all__` on individual submodules (`testing/protocol.py`, etc.) when needed.
+- Do not add long re-export lists to `__init__.py`. Put `__all__` on individual submodules (`protocol_client.py`, `transport.py`, `process.py`, etc.) when needed.
 - **Advanced**: `import server` is allowed but considered unstable until 1.0.0.
 
 ## AI-assisted contributions

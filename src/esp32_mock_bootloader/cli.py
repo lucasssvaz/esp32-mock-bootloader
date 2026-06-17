@@ -9,8 +9,7 @@ import argparse
 import json
 import sys
 
-from esp32_mock_bootloader import chips, daemon
-from esp32_mock_bootloader.server import is_serial_port_name, run_pty_server, run_server
+from esp32_mock_bootloader import chips, daemon, instances
 
 CHIP_CHOICES = sorted(chips.PROFILES.keys()) + ['auto']
 
@@ -27,73 +26,6 @@ def _parse_target_port(value: str) -> int | str:
     if not 1 <= port <= 65535:
         raise argparse.ArgumentTypeError(f'port out of range: {port}')
     return port
-
-
-def _resolve_query_targets(
-    port: int | str | None,
-) -> tuple[str, int | list[dict]]:
-    """Return ('single', port) or ('multi', running_instances)."""
-    if port is not None and port != 'all':
-        return 'single', int(port)
-
-    running = daemon.list_running_daemons()
-    if port == 'all':
-        return 'multi', running
-
-    if len(running) > 1:
-        return 'multi', running
-    if len(running) == 1:
-        return 'single', int(running[0]['port'])
-    return 'single', daemon.DEFAULT_PORT
-
-
-def _print_single_status(info: dict, *, json_output: bool) -> None:
-    if json_output:
-        print(json.dumps(info, indent=2))
-        return
-    status = 'running' if info['running'] else 'stopped'
-    print(f"status: {status}")
-    if info['running']:
-        print(f"pid: {info['pid']}")
-        print(f"port: {info['port']}")
-        print(f"chip: {info['chip']}")
-        print(f"detected_chip: {info['detected_chip']}")
-        print(f"url: {info['url']}")
-        if info.get('log_file'):
-            print(f"log_file: {info['log_file']}")
-
-
-def _print_single_url(port: int, bind: str) -> None:
-    state = daemon.read_state(port)
-    if state and state.get('url'):
-        print(state['url'])
-    else:
-        print(daemon.socket_url(port, bind))
-
-
-def _print_single_port_number(port: int) -> None:
-    state = daemon.read_state(port)
-    if state and state.get('port') is not None:
-        print(state['port'])
-    else:
-        print(port)
-
-
-def _format_status_table(instances: list[dict]) -> str:
-    header = f"{'PORT':<8} {'PID':<8} {'CHIP':<10} {'DETECTED':<12} {'MODE':<12} URL"
-    lines = [header, '-' * len(header)]
-    for info in instances:
-        detected = info.get('detected_chip') or '-'
-        mode = info.get('mode') or '-'
-        lines.append(
-            f"{info['port']:<8} "
-            f"{info['pid']!s:<8} "
-            f"{info['chip']!s:<10} "
-            f"{detected!s:<12} "
-            f"{mode!s:<12} "
-            f"{info['url']}",
-        )
-    return '\n'.join(lines) + '\n'
 
 
 def _add_target_port_arg(parser: argparse.ArgumentParser) -> None:
@@ -118,11 +50,14 @@ def _add_chip_port_bind_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
+    from esp32_mock_bootloader.server import is_serial_port_name, run_pty_server, run_server
+
+    port_file = getattr(args, 'port_file', None)
     if args.pty:
         client_port = args.port if is_serial_port_name(args.port) else None
         run_pty_server(
             args.timeout,
-            args.pty_path_file,
+            port_file,
             args.chip,
             client_port=client_port,
             serial_bind=args.serial_bind,
@@ -136,6 +71,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             args.bind,
             exit_on_disconnect=args.exit_on_disconnect,
             track_registry=not args.daemon_child,
+            port_file=port_file,
         )
     return 0
 
@@ -157,37 +93,40 @@ def _cmd_start(args: argparse.Namespace) -> int:
 
 
 def _cmd_stop(args: argparse.Namespace) -> int:
-    mode, target = _resolve_query_targets(args.port)
-    if mode == 'single':
-        daemon.stop_daemon(int(target))
-        return 0
-
-    instances = target
-    if not instances:
-        return 0
-    for info in instances:
-        daemon.stop_daemon(int(info['port']))
+    instances.stop(args.port)
     return 0
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
-    mode, target = _resolve_query_targets(args.port)
-    if mode == 'single':
-        info = daemon.daemon_status(int(target))
-        _print_single_status(info, json_output=args.json)
-        return 1 if not info['running'] else 0
+    fmt = 'json' if args.json else 'text'
+    data = instances.status(args.port, format='data')
+    if fmt == 'json':
+        instances.status(args.port, format='json', file=sys.stdout)
+        if isinstance(data, dict) and not data.get('running'):
+            return 1
+        if isinstance(data, list) and not data:
+            return 1
+        return 0
 
-    instances = target
-    if not instances:
-        if args.json:
-            print(json.dumps({'instances': []}, indent=2))
-        else:
-            print('no running mock bootloader instances', file=sys.stderr)
+    if isinstance(data, dict):
+        if not data.get('running'):
+            status_text = 'stopped'
+            print(f'status: {status_text}')
+            return 1
+        print(f"status: running")
+        print(f"pid: {data['pid']}")
+        print(f"port: {data['port']}")
+        print(f"chip: {data['chip']}")
+        print(f"detected_chip: {data['detected_chip']}")
+        print(f"url: {data['url']}")
+        if data.get('log_file'):
+            print(f"log_file: {data['log_file']}")
+        return 0
+
+    if not data:
+        print('no running mock bootloader instances', file=sys.stderr)
         return 1
-    if args.json:
-        print(json.dumps({'instances': instances}, indent=2))
-    else:
-        sys.stdout.write(_format_status_table(instances))
+    instances.status(args.port, format='text', file=sys.stdout)
     return 0
 
 
@@ -217,42 +156,34 @@ def _cmd_chips(args: argparse.Namespace) -> int:
 
 
 def _cmd_url(args: argparse.Namespace) -> int:
-    mode, target = _resolve_query_targets(args.port)
-    if mode == 'single':
-        _print_single_url(int(target), args.bind)
+    result = instances.url(args.port, bind=args.bind)
+    if isinstance(result, str):
+        print(result)
         return 0
-
-    instances = target
-    if not instances:
+    if not result:
         print('no running mock bootloader instances', file=sys.stderr)
         return 1
-    for info in instances:
-        print(f"{info['port']}\t{info['url']}")
+    for port, url in result:
+        print(f'{port}\t{url}')
     return 0
 
 
 def _cmd_port(args: argparse.Namespace) -> int:
-    mode, target = _resolve_query_targets(args.port)
-    if mode == 'single':
-        _print_single_port_number(int(target))
+    result = instances.port(args.port)
+    if isinstance(result, int):
+        print(result)
         return 0
-
-    instances = target
-    if not instances:
+    if not result:
         print('no running mock bootloader instances', file=sys.stderr)
         return 1
-    for info in instances:
-        print(info['port'])
+    for port in result:
+        print(port)
     return 0
 
 
 def _cmd_erase_flash(args: argparse.Namespace) -> int:
-    mode, target = _resolve_query_targets(args.port)
     try:
-        if mode == 'single':
-            ports = daemon.erase_flash(port=int(target))
-        else:
-            ports = daemon.erase_flash(port='all')
+        ports = instances.erase_flash(args.port)
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -300,11 +231,13 @@ def build_parser() -> argparse.ArgumentParser:
         '--daemon-child', action='store_true',
         help=argparse.SUPPRESS,
     )
+    run_p.add_argument(
+        '--port-file',
+        help=argparse.SUPPRESS,
+    )
     mode = run_p.add_mutually_exclusive_group()
     mode.add_argument('--pty', action='store_true',
                       help='Serial path mode: PTY (Unix), com0com COM pair, or socket URL fallback')
-    run_p.add_argument('--pty-path-file',
-                       help='Output file for the client port (PTY path, COM name, or socket:// URL)')
     run_p.add_argument(
         '--serial-bind',
         help=(

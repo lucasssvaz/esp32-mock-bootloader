@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Lucas Saavedra Vaz
 # SPDX-License-Identifier: Apache-2.0
 
-"""Transport integration and com0com helper tests."""
+"""com0com.py unit and integration tests."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from esp32_mock_bootloader import chips, registers, server
+from esp32_mock_bootloader import process, server
 from esp32_mock_bootloader.com0com import (
     Com0ComError,
     ComPair,
@@ -28,133 +28,10 @@ from esp32_mock_bootloader.com0com import (
     run_setupc,
     wait_for_ports,
 )
-
-import esp32_mock_bootloader.testing as mock
+from tests.helpers import esptool
 
 FIXTURES = Path(__file__).resolve().parent / 'fixtures'
 FAKE_SETUPC = FIXTURES / 'fake_setupc.py'
-
-pytestmark = [pytest.mark.transport, pytest.mark.esptool]
-
-
-@pytest.mark.parametrize('transport', mock.constants.TRANSPORTS)
-@pytest.mark.parametrize('chip', mock.constants.ESPTOOL_CHIPS)
-def test_protocol_smoke(transport: str, chip: str):
-    with mock.server.running_mock(transport, chip, timeout=30.0) as (proc, port, pty_path):
-        assert proc.poll() is None
-        sock = mock.server.connect_transport(transport, port=port, pty_path=pty_path)
-        try:
-            assert mock.protocol.minimal_plain_flash(sock)
-        finally:
-            sock.close()
-
-
-@pytest.mark.parametrize('transport', mock.constants.TRANSPORTS)
-@pytest.mark.parametrize('chip', mock.constants.ESPTOOL_CHIPS)
-def test_explicit_chip_detect_register(transport: str, chip: str):
-    profile = chips.PROFILES[chip]
-    if not profile.detect_magic:
-        pytest.skip(f'{chip} has no detect magic register')
-    with mock.server.running_mock(transport, chip, timeout=30.0) as (_proc, port, pty_path):
-        sock = mock.server.connect_transport(transport, port=port, pty_path=pty_path)
-        try:
-            mock.protocol.send_sync(sock)
-            value = mock.protocol.read_reg_value(sock, profile.detect_reg)
-            assert value == profile.detect_magic
-        finally:
-            sock.close()
-
-
-@pytest.mark.parametrize('transport', mock.constants.TRANSPORTS)
-@pytest.mark.parametrize('chip', mock.constants.ESPTOOL_CHIPS)
-def test_chip_profile_registers(transport: str, chip: str):
-    profile = chips.PROFILES[chip]
-    with mock.server.running_mock(transport, chip, timeout=30.0) as (_proc, port, pty_path):
-        sock = mock.server.connect_transport(transport, port=port, pty_path=pty_path)
-        try:
-            mock.protocol.send_sync(sock)
-            if profile.detect_magic:
-                value = mock.protocol.read_reg_value(sock, profile.detect_reg)
-                assert value == profile.detect_magic
-            efuse_addr = profile.efuse_base + 0x04
-            efuse_value = mock.protocol.read_reg_value(sock, efuse_addr)
-            expected = registers.rom_profile(chip).get(efuse_addr, 0)
-            assert efuse_value == expected
-            assert mock.protocol.minimal_plain_flash(sock)
-        finally:
-            sock.close()
-
-
-@pytest.mark.parametrize('transport', mock.constants.TRANSPORTS)
-@pytest.mark.parametrize('chip', mock.constants.ESPTOOL_CHIPS)
-def test_esptool_write_flash(transport: str, chip: str):
-    with mock.server.running_mock(transport, chip, timeout=30.0) as (_proc, port, pty_path):
-        with tempfile.TemporaryDirectory() as tmp:
-            bin_file = mock.esptool.create_fake_binary(Path(tmp) / 'test.bin', 1024)
-            wrote_ok, detail = mock.esptool.write_flash_no_stub(
-                chip, str(bin_file), port=port, pty_path=pty_path,
-            )
-            assert wrote_ok, detail
-
-
-@pytest.mark.parametrize('transport', mock.constants.TRANSPORTS)
-@pytest.mark.parametrize('chip', mock.constants.ESPTOOL_CHIPS)
-def test_auto_mode_esptool_write_flash(transport: str, chip: str):
-    with mock.server.running_mock(transport, 'auto', timeout=30.0) as (_proc, port, pty_path):
-        with tempfile.TemporaryDirectory() as tmp:
-            bin_file = mock.esptool.create_fake_binary(Path(tmp) / 'test.bin', 1024)
-            wrote_ok, detail = mock.esptool.write_flash_no_stub(
-                chip, str(bin_file), port=port, pty_path=pty_path,
-            )
-            assert wrote_ok, detail
-
-
-def test_pty_path_file_written(tmp_path: Path):
-    path_file = tmp_path / 'mock.pty'
-    proc = None
-    try:
-        proc = mock.server.start_pty(path_file, timeout=30.0, chip='auto', exit_on_disconnect=True)
-        endpoint = mock.server.read_pty_path(path_file)
-        assert endpoint
-        if os.environ.get('ESP32_MOCK_SERIAL_BIND') or os.environ.get('ESP32_MOCK_COM_PORT'):
-            peer = os.environ.get('ESP32_MOCK_PORT') or os.environ.get('ESP32_MOCK_COM_PEER', 'COM19')
-            assert endpoint == peer
-        elif os.name == 'nt':
-            assert endpoint.startswith('socket://')
-        else:
-            assert Path(endpoint).exists()
-        sock = mock.server.connect_transport('pty', pty_path=endpoint)
-        try:
-            assert mock.protocol.minimal_plain_flash(sock)
-        finally:
-            sock.close()
-    finally:
-        if proc is not None and proc.poll() is None:
-            mock.server.stop_subprocess(proc)
-
-
-@pytest.mark.com0com
-@pytest.mark.skipif(os.name != 'nt', reason='Windows com0com test')
-def test_windows_com0com_esptool():
-    """Creates a com0com pair via setupc (requires admin + com0com installed)."""
-    from esp32_mock_bootloader.com0com import Com0ComError, com0com_pair
-
-    com_bind = os.environ.get('ESP32_MOCK_SERIAL_BIND') or os.environ.get('ESP32_MOCK_COM_PORT', 'COM18')
-    com_peer = os.environ.get('ESP32_MOCK_PORT') or os.environ.get('ESP32_MOCK_COM_PEER', 'COM19')
-    try:
-        with com0com_pair(com_bind, com_peer) as pair:
-            os.environ['ESP32_MOCK_SERIAL_BIND'] = pair.server
-            os.environ['ESP32_MOCK_PORT'] = pair.peer
-            with mock.server.running_mock('pty', 'auto', timeout=60.0) as (_proc, _port, endpoint):
-                with tempfile.TemporaryDirectory() as tmp:
-                    bin_file = mock.esptool.create_fake_binary(Path(tmp) / 'test.bin', 1024)
-                    assert endpoint == pair.peer
-                    wrote_ok, detail = mock.esptool.write_flash_no_stub(
-                        'esp32', str(bin_file), pty_path=endpoint,
-                    )
-                    assert wrote_ok, detail
-    except Com0ComError as exc:
-        pytest.skip(str(exc))
 
 
 @pytest.fixture
@@ -388,3 +265,26 @@ def test_keep_com_pair_env(monkeypatch: pytest.MonkeyPatch):
     assert keep_com_pair() is False
     monkeypatch.setenv('ESP32_MOCK_KEEP_COM_PAIR', 'yes')
     assert keep_com_pair() is True
+
+
+@pytest.mark.com0com
+@pytest.mark.esptool
+@pytest.mark.skipif(os.name != 'nt', reason='Windows com0com test')
+def test_windows_com0com_esptool():
+    """Creates a com0com pair via setupc (requires admin + com0com installed)."""
+    com_bind = os.environ.get('ESP32_MOCK_SERIAL_BIND') or os.environ.get('ESP32_MOCK_COM_PORT', 'COM18')
+    com_peer = os.environ.get('ESP32_MOCK_PORT') or os.environ.get('ESP32_MOCK_COM_PEER', 'COM19')
+    try:
+        with com0com_pair(com_bind, com_peer) as pair:
+            os.environ['ESP32_MOCK_SERIAL_BIND'] = pair.server
+            os.environ['ESP32_MOCK_PORT'] = pair.peer
+            with process.running_mock('pty', 'auto', timeout=60.0) as (_proc, _port, endpoint):
+                with tempfile.TemporaryDirectory() as tmp:
+                    bin_file = esptool.create_fake_binary(Path(tmp) / 'test.bin', 1024)
+                    assert endpoint == pair.peer
+                    ok, detail = esptool.write_flash_no_stub(
+                        'esp32', str(bin_file), pty_path=endpoint,
+                    )
+                    assert ok, detail
+    except Com0ComError as exc:
+        pytest.skip(str(exc))

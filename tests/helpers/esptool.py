@@ -10,7 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from esp32_mock_bootloader.testing import constants
+from esp32_mock_bootloader import constants
 
 
 def esptool_available() -> bool:
@@ -60,7 +60,6 @@ def forbidden_warnings(
     *,
     transport: str = 'socket',
 ) -> list[str]:
-    """Return esptool Warning lines that are not allowed for mock fidelity tests."""
     allowed_fragments = (
         'Device VID/PID identification is only supported on',
         'Failed to get VID/PID of a device on',
@@ -69,7 +68,7 @@ def forbidden_warnings(
         'Deprecated: Command',
     )
     if transport == 'socket':
-        pass  # VID/PID socket messages are expected on all transports in CI.
+        pass
     warnings: list[str] = []
     for line in output.splitlines():
         if 'Warning:' not in line:
@@ -126,7 +125,6 @@ def write_flash_at(
     timeout: float = 60.0,
     extra_args: tuple[str, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
-    """Run esptool write-flash at a specific offset with optional --diff-with."""
     if (port is None) == (pty_path is None):
         raise ValueError('exactly one of port or pty_path is required')
     esptool_port = pty_path if pty_path is not None else f'socket://localhost:{port}'
@@ -186,7 +184,6 @@ def write_flash_no_stub(
     pty_path: str | None = None,
     timeout: float = 30.0,
 ) -> tuple[bool, str]:
-    """write-flash with --no-stub (ROM MD5: 32-byte hex response)."""
     return write_flash(
         chip, bin_path, port=port, pty_path=pty_path, no_stub=True, timeout=timeout,
     )
@@ -201,7 +198,6 @@ def write_flash_with_stub(
     timeout: float = 30.0,
     extra_args: tuple[str, ...] = ('-z',),
 ) -> tuple[bool, str]:
-    """write-flash with default stub (binary MD5: 16-byte digest response)."""
     return write_flash(
         chip,
         bin_path,
@@ -213,20 +209,10 @@ def write_flash_with_stub(
     )
 
 
-# Backward-compatible aliases matching prior conftest names.
-esptool_write_flash = write_flash
-esptool_write_flash_at = write_flash_at
-esptool_write_flash_no_stub = write_flash_no_stub
-esptool_write_flash_with_stub = write_flash_with_stub
-
 __all__ = [
     'create_fake_binary',
     'create_pattern_binary',
     'esptool_available',
-    'esptool_write_flash',
-    'esptool_write_flash_at',
-    'esptool_write_flash_no_stub',
-    'esptool_write_flash_with_stub',
     'forbidden_warnings',
     'run_esptool',
     'run_flash_id',

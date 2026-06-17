@@ -17,7 +17,9 @@ import pytest
 
 from esp32_mock_bootloader import daemon
 
-import esp32_mock_bootloader.testing as mock
+from esp32_mock_bootloader import constants, process, protocol_client
+from esp32_mock_bootloader.registry import Registry
+from tests.helpers import esptool
 
 
 def test_socket_url_wildcard_bind():
@@ -43,7 +45,7 @@ def test_stop_daemon_stale_pid():
 
 
 def test_start_force_replaces_daemon():
-    port = mock.server.reserve_tcp_port()
+    port = process.reserve_tcp_port()
     try:
         first = daemon.start_daemon(port=port, chip_mode='auto')
         second = daemon.start_daemon(port=port, chip_mode='esp32', force=True)
@@ -105,7 +107,7 @@ def test_unregister_instance_is_idempotent():
 
 
 def test_start_daemon_exits_during_startup(monkeypatch):
-    port = mock.server.reserve_tcp_port()
+    port = process.reserve_tcp_port()
 
     class DeadProc:
         pid = 424242
@@ -123,7 +125,7 @@ def test_start_daemon_exits_during_startup(monkeypatch):
 
 
 def test_start_daemon_hang_terminates(monkeypatch):
-    port = mock.server.reserve_tcp_port()
+    port = process.reserve_tcp_port()
 
     class HangProc:
         pid = 424243
@@ -184,6 +186,7 @@ def test_stop_daemon_windows_taskkill(monkeypatch):
     assert calls == [424244]
 
 
+@pytest.mark.skipif(os.name == 'nt', reason='SIGTERM via os.kill is Unix-only; Windows uses taskkill')
 def test_stop_daemon_sends_sigterm(monkeypatch):
     pid = 424245
     daemon.write_state(39906, {'pid': pid, 'port': 39906})
@@ -204,8 +207,8 @@ def test_stop_daemon_sends_sigterm(monkeypatch):
 
 
 def test_stop_all_daemons():
-    port_a = mock.server.reserve_tcp_port()
-    port_b = mock.server.reserve_tcp_port()
+    port_a = process.reserve_tcp_port()
+    port_b = process.reserve_tcp_port()
     try:
         daemon.start_daemon(port=port_a, chip_mode='auto')
         daemon.start_daemon(port=port_b, chip_mode='auto')
@@ -219,6 +222,128 @@ def test_stop_all_daemons():
 
 def test_stop_all_daemons_empty():
     assert daemon.stop_all_daemons() == []
+
+
+def test_erase_flash_requires_client_url(monkeypatch, registry_root: Registry):
+    port = process.reserve_tcp_port()
+    monkeypatch.setattr(
+        daemon,
+        'daemon_status',
+        lambda _port, base=None: {'running': True, 'url': None},
+    )
+    with pytest.raises(RuntimeError, match='no client URL'):
+        daemon.erase_flash(port=port, base=registry_root.path)
+
+
+def test_erase_flash_all_requires_client_url(monkeypatch, registry_root: Registry):
+    monkeypatch.setattr(
+        daemon,
+        'list_running_daemons',
+        lambda base=None: [{'port': 12345, 'url': None}],
+    )
+    with pytest.raises(RuntimeError, match='no client URL'):
+        daemon.erase_flash(port='all', base=registry_root.path)
+
+
+def test_erase_flash_at_url_bad_response(monkeypatch):
+    class FakeSock:
+        def settimeout(self, _value: float) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        'esp32_mock_bootloader.transport.connect_serial_endpoint',
+        lambda _url: FakeSock(),
+    )
+    from esp32_mock_bootloader import protocol_client
+
+    monkeypatch.setattr(protocol_client, 'send_sync', lambda _sock: None)
+    monkeypatch.setattr(protocol_client, 'activate_stub', lambda _sock: None)
+    monkeypatch.setattr(protocol_client, 'send_and_receive', lambda *_a, **_k: b'')
+    with pytest.raises(RuntimeError, match='no response to ERASE_FLASH'):
+        daemon._erase_flash_at_url('socket://127.0.0.1:9999')
+
+
+def test_terminate_pid_ignores_invalid():
+    daemon._terminate_pid(0)
+    daemon._terminate_pid(-1)
+
+
+def test_set_detected_chip_ignores_none(monkeypatch, registry_root: Registry):
+    port = process.reserve_tcp_port()
+    monkeypatch.setattr(daemon, 'is_pid_running', lambda pid: pid == 424299)
+    daemon.write_state(
+        port,
+        {'pid': 424299, 'port': port, 'detected_chip': 'esp32'},
+        base=registry_root.path,
+    )
+    daemon.set_detected_chip(port, None, base=registry_root.path)
+    state = daemon.read_state(port, registry_root.path)
+    assert state is not None
+    assert state['detected_chip'] == 'esp32'
+
+
+def test_prune_registry_removes_stale_instances(monkeypatch, tmp_path):
+    daemon.register_instance(39911, {'pid': 1, 'port': 39911}, base=tmp_path)
+    monkeypatch.setattr(daemon, 'is_pid_running', lambda _pid: False)
+    daemon.prune_registry(tmp_path)
+    assert '39911' not in daemon.load_registry(tmp_path)['instances']
+
+
+def test_start_daemon_force_replaces_existing(monkeypatch, registry_root: Registry):
+    port = process.reserve_tcp_port()
+    daemon.start_daemon(port=port, chip_mode='esp32', base=registry_root.path)
+    stopped: list[int] = []
+    monkeypatch.setattr(
+        daemon,
+        'stop_daemon',
+        lambda p, base=None: stopped.append(p) or True,
+    )
+    daemon.start_daemon(
+        port=port, chip_mode='esp32', base=registry_root.path, force=True,
+    )
+    assert stopped == [port]
+
+
+def test_load_registry_rejects_non_object_instances(tmp_path):
+    path = daemon.registry_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"instances": "bad"}', encoding='utf-8')
+    assert daemon.load_registry(tmp_path) == {'version': 1, 'instances': {}}
+
+
+def test_runtime_dir_explicit_base(tmp_path):
+    custom = tmp_path / 'custom-state'
+    assert daemon.runtime_dir(custom) == custom.resolve()
+
+
+def test_erase_flash_at_url_command_failure(monkeypatch):
+    class FakeSock:
+        def settimeout(self, _value: float) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        'esp32_mock_bootloader.transport.connect_serial_endpoint',
+        lambda _url: FakeSock(),
+    )
+    from esp32_mock_bootloader import protocol, protocol_client
+
+    monkeypatch.setattr(protocol_client, 'send_sync', lambda _sock: None)
+    monkeypatch.setattr(protocol_client, 'activate_stub', lambda _sock: None)
+    monkeypatch.setattr(protocol_client, 'send_and_receive', lambda *_a, **_k: b'\x00\xff')
+    monkeypatch.setattr(protocol_client, 'slip_decode_frames', lambda raw: [raw] if raw else [])
+    monkeypatch.setattr(
+        protocol_client,
+        'parse_response',
+        lambda _frame: (0, protocol.CMD_ERASE_FLASH, 0, 0x01, b''),
+    )
+    with pytest.raises(RuntimeError, match='ERASE_FLASH failed'):
+        daemon._erase_flash_at_url('socket://127.0.0.1:9999')
 
 
 def test_runtime_dir_resolves_env_path(monkeypatch, tmp_path):
@@ -246,12 +371,10 @@ def test_runtime_dir_unix_path_without_drive_not_cwd(monkeypatch, tmp_path):
     )
     resolved = daemon.runtime_dir()
     if os.name == 'nt':
-        assert resolved == (
-            Path(tempfile.gettempdir()).resolve()
-            / 'private/var/folders/T/pytest/test_stop_daemon_windows_taskk0/state'
-        ).resolve()
+        expected = Path('/private/var/folders/T/pytest/test_stop_daemon_windows_taskk0/state').resolve()
     else:
-        assert resolved == Path(
+        expected = Path(
             '/private/var/folders/T/pytest/test_stop_daemon_windows_taskk0/state',
         ).resolve()
+    assert resolved == expected
     assert tmp_path not in resolved.parents

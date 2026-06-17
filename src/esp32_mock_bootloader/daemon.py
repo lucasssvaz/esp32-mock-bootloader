@@ -26,7 +26,7 @@ REGISTRY_VERSION = 1
 def _is_truly_absolute(path: str) -> bool:
     """Return whether *path* is usable as an absolute path on this OS."""
     if sys.platform == 'win32':
-        return bool(Path(path).drive) or path.startswith('\\\\')
+        return bool(Path(path).drive) or path.startswith('\\\\') or path.startswith('/')
     return os.path.isabs(path)
 
 
@@ -79,22 +79,31 @@ def _registry_lock(base: Path | None = None) -> Iterator[None]:
     path = _registry_lock_path(base)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, 'a+', encoding='utf-8') as lock_file:
+        lock_backend = 'fcntl'
         try:
             if os.name == 'nt':
-                import msvcrt
-                lock_file.seek(0)
-                msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
-            else:
+                try:
+                    import msvcrt
+                except ImportError:
+                    pass
+                else:
+                    lock_backend = 'msvcrt'
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+            if lock_backend == 'fcntl':
                 import fcntl
+
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
             yield
         finally:
-            if os.name == 'nt':
+            if lock_backend == 'msvcrt':
                 import msvcrt
+
                 lock_file.seek(0)
                 msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
             else:
                 import fcntl
+
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
@@ -431,26 +440,19 @@ def erase_flash(
 
 def _erase_flash_at_url(url: str) -> None:
     from esp32_mock_bootloader import protocol
-    from esp32_mock_bootloader.testing.protocol import (
-        activate_stub,
-        make_command,
-        parse_response,
-        send_and_receive,
-        send_sync,
-        slip_decode_frames,
-    )
-    from esp32_mock_bootloader.testing.server import connect_serial_endpoint
+    from esp32_mock_bootloader import protocol_client
+    from esp32_mock_bootloader.transport import connect_serial_endpoint
 
     sock = connect_serial_endpoint(url)
     sock.settimeout(10.0)
     try:
-        send_sync(sock)
-        activate_stub(sock)
-        raw = send_and_receive(sock, make_command(protocol.CMD_ERASE_FLASH))
-        frames = slip_decode_frames(raw)
+        protocol_client.send_sync(sock)
+        protocol_client.activate_stub(sock)
+        raw = protocol_client.send_and_receive(sock, protocol_client.make_command(protocol.CMD_ERASE_FLASH))
+        frames = protocol_client.slip_decode_frames(raw)
         if not frames:
             raise RuntimeError('no response to ERASE_FLASH')
-        _direction, cmd, _size, value, _data = parse_response(frames[0])
+        _direction, cmd, _size, value, _data = protocol_client.parse_response(frames[0])
         if cmd != protocol.CMD_ERASE_FLASH or value != 0:
             raise RuntimeError(f'ERASE_FLASH failed (cmd=0x{cmd:02x} status={value})')
     finally:

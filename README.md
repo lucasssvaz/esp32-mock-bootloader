@@ -142,10 +142,9 @@ Common flags for `start` and `run`:
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--chip` | `auto` | Chip profile, or `auto` to detect from client traffic |
-| `--port` | `9876` | TCP listen port (`run` / `start`); with `run --pty` in null-modem mode, the **upload client** serial port (e.g. `COM19`) — same port you pass to esptool |
+| `--port` | `9876` | TCP listen port (`run` / `start`); with `run --pty` in null-modem mode, the **upload client** serial port (e.g. `COM19`) — same port you pass to esptool. Falls back to OS-assigned port if taken. |
 | `--serial-bind` | — | `run --pty` only: mock-side port in a null-modem pair; auto-detected from com0com when only `--port` is set |
 | `--pty` | off | `run` only: serial path mode (Unix PTY, null-modem COM, or Windows socket fallback) |
-| `--pty-path-file` | — | `run --pty`: write the client endpoint here (PTY path, COM name, or `socket://` URL) |
 | `--bind` | `127.0.0.1` | Bind address |
 | `--startup-timeout` | `30` | Seconds `start` waits for the port (`start` only) |
 | `--force` | off | Stop an existing daemon on the same port first (`start` only) |
@@ -271,7 +270,9 @@ These messages are harmless for upload tests. Only a physical Espressif USB-Seri
 Use `--pty` with `run` when a tool expects a **device path** instead of a URL (common with arduino-cli):
 
 ```bash
-esp32-mock-bootloader run --pty --pty-path-file /tmp/mock-pty --chip esp32
+esp32-mock-bootloader run --pty --chip esp32
+# The PTY path is printed to stdout; use --port-file to write it to a file:
+esp32-mock-bootloader run --pty --port-file /tmp/mock-pty --chip esp32
 esptool --chip esp32 --port "$(cat /tmp/mock-pty)" write-flash 0x10000 firmware.bin
 ```
 
@@ -289,7 +290,7 @@ Both modes expose a **serial device path** to the client, but they create that p
 |--|------------------------|---------------------------------------|
 | **What it is** | Kernel pseudo-terminal pair created by the mock | Two ends of an existing serial device (virtual or physical) |
 | **Server I/O** | Master side of the PTY (`PtyMasterTransport`) | pyserial on `--serial-bind` |
-| **Client path** | Slave device (e.g. `/dev/ttys003`) | `--port` (e.g. `COM19`); written to `--pty-path-file` |
+| **Client path** | Slave device (e.g. `/dev/ttys003`) | `--port` (e.g. `COM19`); written to `--port-file` |
 | **Typical platform** | Linux / macOS | Windows (com0com); Linux with `socat` loopback |
 | **Needs extra software** | No | Yes on Windows (com0com); paired ports on Linux |
 
@@ -304,7 +305,7 @@ Legacy env vars `ESP32_MOCK_COM_PORT` / `ESP32_MOCK_COM_PEER` still work; prefer
 Install [com0com](https://sourceforge.net/projects/com0com/). The mock binds the paired port; **`--port`** is what esptool uses (written to the path file):
 
 ```bat
-esp32-mock-bootloader run --pty --pty-path-file mock.port ^
+esp32-mock-bootloader run --pty --port-file mock.port ^
   --port COM19 --chip esp32
 esptool --chip esp32 --port COM19 write-flash 0x10000 firmware.bin
 ```
@@ -312,7 +313,7 @@ esptool --chip esp32 --port COM19 write-flash 0x10000 firmware.bin
 To name both ends explicitly:
 
 ```bat
-esp32-mock-bootloader run --pty --pty-path-file mock.port ^
+esp32-mock-bootloader run --pty --port-file mock.port ^
   --serial-bind COM18 --port COM19 --chip esp32
 ```
 
@@ -406,40 +407,77 @@ esp32-mock-bootloader stop
 
 ## Python API
 
-Downstream projects can integrate the mock without shelling out to the CLI. Import **submodules by name** — avoid long symbol lists from the package root.
+The public surface is intentionally small: start a mock, read its endpoint, optionally query or stop running instances. Upload clients (esptool, arduino-cli) connect to `handle.url()` — the mock never runs uploads for you.
 
-| Tier | Import | Use case |
-|------|--------|----------|
-| High-level | `from esp32_mock_bootloader import MockBootloader` | CI scripts, pytest fixtures |
-| Testing helpers | `import esp32_mock_bootloader.testing as mock` | Protocol clients, esptool upload tests |
-| Chip metadata | `from esp32_mock_bootloader import chips` | `chips.PROFILES`, `chips.SUPPORTED` |
-| Protocol constants | `from esp32_mock_bootloader import protocol` | `protocol.CMD_SYNC`, checksum helpers |
-| Daemon control | `from esp32_mock_bootloader import daemon` | Background mock (`start_daemon` / `stop_daemon`) |
-| Advanced | `from esp32_mock_bootloader import server` | In-process SLIP handlers (unstable in 0.x) |
+**Exports:** `mock_bootloader`, `MockHandle`, `instances`, `__version__`
 
-**Context manager** (recommended for tests):
+### Style A — context manager (single instance, auto cleanup)
 
 ```python
-from esp32_mock_bootloader import MockBootloader
-import esp32_mock_bootloader.testing as mock
+import subprocess
+from esp32_mock_bootloader import mock_bootloader
 
-with MockBootloader(chip="auto") as bootloader:
-    sock = bootloader.connect()
-    mock.protocol.send_sync(sock)
-    # bootloader.url → "socket://127.0.0.1:PORT"
+with mock_bootloader(chip="esp32") as mock:
+    subprocess.run(["esptool", "--chip", "esp32", "--port", mock.url(), "write-flash", ...])
 ```
 
-**esptool integration test** in another project:
+### Style B — imperative (multiple instances)
 
 ```python
-import esp32_mock_bootloader.testing as mock
+from esp32_mock_bootloader import mock_bootloader
 
-with mock.server.running_server(chip="esp32") as (_proc, port):
-    ok, detail = mock.esptool.write_flash_no_stub("esp32", "app.bin", port=port)
-    assert ok, detail
+server_a = mock_bootloader(chip="esp32")
+server_b = mock_bootloader(chip="esp32c3")
+try:
+    # point esptool / arduino-cli at server_a.url() and server_b.url()
+    ...
+finally:
+    server_b.stop()
+    server_a.stop()
 ```
 
-Reference constants (`FLASH_APP_OFFSET`, `SYNC_PAYLOAD`, …) live in `esp32_mock_bootloader.testing.constants`.
+### `instances` — CLI-parity operations
+
+Same verbs as `esp32-mock-bootloader status|url|port|stop|erase-flash`:
+
+```python
+from esp32_mock_bootloader import mock_bootloader, instances
+
+server_a = mock_bootloader(chip="esp32")
+server_b = mock_bootloader(chip="esp32c3")
+
+print(instances.status(format="text"))   # table of all running mocks
+rows = instances.status()              # list[dict] when multiple
+urls = instances.url(port="all")
+instances.erase_flash(port=server_a.port())
+instances.stop(port="all")
+```
+
+Each `MockHandle` exposes the same verbs scoped to that server: `server_a.url()`, `server_a.status()`, `server_a.erase_flash()`, `server_a.stop()`, etc.
+
+Default mode for ``mock_bootloader()`` is **foreground** (subprocess server; stops when the handle is destroyed or the ``with`` block ends). Use ``mode="daemon"`` for a background daemon like ``esp32-mock-bootloader start``.
+
+### Advanced (opt-in)
+
+Protocol testing and raw transports live under `esp32_mock_bootloader.advanced`:
+
+```python
+from esp32_mock_bootloader import mock_bootloader
+from esp32_mock_bootloader.advanced import protocol
+
+server = mock_bootloader(chip="esp32")
+try:
+    client = protocol.connect(server)
+    client.send_command(cmd, data)
+finally:
+    server.stop()
+```
+
+Also exported: `transport`, `process`, `protocol_client`, `constants`. Chip metadata: `from esp32_mock_bootloader import chips`.
+
+Runnable scripts with comments live under [`examples/`](examples/README.md) (basic upload patterns and `esp32_mock_bootloader.advanced` protocol examples).
+
+Reference constants (`FLASH_APP_OFFSET`, `SYNC_PAYLOAD`, …) live in `esp32_mock_bootloader.constants`.
 
 ## How it works
 
@@ -511,14 +549,16 @@ pytest                                      # parallel by default (pytest-xdist)
 pytest -n0                                  # single process (debugging)
 pytest -m "not esptool"                     # protocol unit tests only
 pytest -m "not transport"                     # skip TCP/PTY integration
-pytest tests/test_transports.py             # transport matrix only
+pytest tests/test_protocol.py -m transport  # TCP transport smoke only
+pytest tests/test_process.py                # process.py + transport.py (advanced)
+pytest tests/test_com0com.py                # com0com unit tests
 ```
 
 CI runs the full suite on Ubuntu, Windows, and macOS (parallel via pytest-xdist), enforces coverage baselines on Ubuntu, and verifies parallel subprocess coverage with `scripts/verify_parallel_coverage.py`.
 
 **com0com testing tiers:**
 
-1. **CI (all OS)** — `tests/test_transports.py` uses `tests/fixtures/fake_setupc.py` (no driver install).
+1. **CI (all OS)** — `tests/test_com0com.py` uses `tests/fixtures/fake_setupc.py` (no driver install).
 2. **Windows CI** — `test_windows_com0com_esptool` skips when setupc is missing or not elevated.
 3. **Local Windows** — install com0com, run elevated: `pytest -m com0com` or `scripts/test_windows_com.py`.
 
@@ -549,13 +589,22 @@ hatch build
 ```
 esp32-mock-bootloader/
 ├── CONTRIBUTING.md              # PR guidelines and AI policy
-├── src/esp32_mock_bootloader/   # Python package (api, testing, CLI, daemon, SLIP server)
-│   ├── api.py                   # MockBootloader context manager
-│   ├── testing/                 # Public helpers for downstream CI/tests
+├── src/esp32_mock_bootloader/   # Python package (api, CLI, daemon, SLIP server)
+│   ├── registry.py              # Registry (multi-instance coordination)
+│   ├── session.py               # Internal Session / SessionGroup lifecycle
+│   ├── client.py                # Protocol Client (bound to Session)
+│   ├── api.py                   # mock_bootloader() and MockHandle
+│   ├── instances.py             # CLI-parity status/url/port/stop/erase_flash
+│   ├── advanced/                # Opt-in protocol.connect, transport, process, constants
+│   ├── constants.py             # Protocol/layout reference values
+│   ├── transport.py             # TCP / PTY / serial client connections
+│   ├── process.py               # Subprocess spawn and teardown helpers
+│   ├── protocol_client.py       # SLIP client helpers
 │   ├── chips.py                 # Chip profiles from esptool
 │   ├── registers.py             # Sparse ROM register profile for esptool fidelity
 │   ├── protocol.py              # Protocol constants
 │   └── server.py                # SLIP server (advanced)
+├── examples/                    # Runnable basic + advanced usage examples
 ├── action/                      # Node.js steps for the GitHub Action
 ├── action.yml                   # Composite action entry point
 ├── tests/                       # pytest suite (protocol, esptool, transports)

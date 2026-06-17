@@ -92,7 +92,7 @@ def parse_coverage_gaps(xml_path: Path, *, src_root: Path = SRC) -> list[ModuleG
 
     for cls in root.findall('.//class'):
         filename = cls.get('filename', '')
-        if not filename or '/testing/' in filename:
+        if not filename:
             continue
         module = _module_key(filename)
         lines = cls.findall('lines/line')
@@ -128,7 +128,6 @@ def format_text_report(modules: list[ModuleGaps], *, max_ranges: int = 30) -> st
     total_missed = sum(module.missed for module in modules)
     lines = [
         f'Coverage gaps — {len(modules)} module(s), {total_missed} uncovered line(s)',
-        f'(product code only; {SRC.name}/testing/ omitted)',
         '',
     ]
     for module in modules:
@@ -164,7 +163,7 @@ def format_github_summary(
         '### Coverage gaps',
         '',
         f'{len(modules)} module(s) with uncovered lines '
-        f'(**{total_missed}** lines total; `testing/` omitted).',
+        f'(**{total_missed}** lines total).',
         '',
     ]
     for module in modules[:top]:

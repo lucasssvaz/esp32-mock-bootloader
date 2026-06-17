@@ -10,8 +10,10 @@ from pathlib import Path
 
 import pytest
 
-import esp32_mock_bootloader.testing as mock
-from esp32_mock_bootloader import protocol
+from esp32_mock_bootloader import constants, protocol_client
+from tests.helpers import esptool
+from esp32_mock_bootloader import mock_bootloader, protocol
+from esp32_mock_bootloader.advanced import protocol as protocol_api
 from esp32_mock_bootloader import chips
 from esp32_mock_bootloader import registers
 
@@ -21,27 +23,25 @@ pytestmark = pytest.mark.esptool
 STUB_MD5_REPRESENTATIVE_CHIPS = ('esp32', 'esp32c3', 'esp8266')
 
 # esptool --diff-with compares 4 KiB sectors; four sectors = 16 KiB (matches esptool tests).
-DIFF_FLASH_SIZE = protocol.FLASH_SECTOR_SIZE * mock.constants.DIFF_FLASH_SECTOR_COUNT
-DIFF_FLASH_ADDR = mock.constants.FLASH_APP_OFFSET
+DIFF_FLASH_SIZE = protocol.FLASH_SECTOR_SIZE * constants.DIFF_FLASH_SECTOR_COUNT
+DIFF_FLASH_ADDR = constants.FLASH_APP_OFFSET
 
 
 def test_esptool_write_flash_no_stub(esptool_port, reference_chip):
     with tempfile.TemporaryDirectory() as tmp:
-        bin_file = mock.esptool.create_fake_binary(Path(tmp) / 'test.bin', 1024)
-        wrote_ok, detail = mock.esptool.write_flash_no_stub(
-            reference_chip, str(bin_file), port=esptool_port,
-        )
+        bin_file = esptool.create_fake_binary(Path(tmp) / 'test.bin', 1024)
+        wrote_ok, detail = esptool.write_flash_no_stub(reference_chip, str(bin_file), port=esptool_port.port())
         assert wrote_ok, detail
 
 
 def test_esptool_write_flash_with_stub(esptool_port, reference_chip):
     """Default esptool path: stub upload + SPI_FLASH_MD5 binary digest."""
     with tempfile.TemporaryDirectory() as tmp:
-        bin_file = mock.esptool.create_fake_binary(Path(tmp) / 'test.bin', 2048)
-        wrote_ok, detail = mock.esptool.write_flash_with_stub(
+        bin_file = esptool.create_fake_binary(Path(tmp) / 'test.bin', 2048)
+        wrote_ok, detail = esptool.write_flash_with_stub(
             reference_chip,
             str(bin_file),
-            port=esptool_port,
+            port=esptool_port.port(),
             extra_args=(
                 '-z', '--flash-mode', 'dio', '--flash-freq', '40m', '--flash-size', '4MB',
             ),
@@ -52,24 +52,21 @@ def test_esptool_write_flash_with_stub(esptool_port, reference_chip):
 @pytest.mark.parametrize('chip', STUB_MD5_REPRESENTATIVE_CHIPS)
 def test_esptool_write_flash_with_stub_representative_chips(chip: str):
     """Stub upload + SPI_FLASH_MD5 on esp32, esp32c3, and esp8266."""
-    if chip not in mock.constants.ESPTOOL_CHIPS:
+    if chip not in constants.ESPTOOL_CHIPS:
         pytest.skip(f'{chip} not supported by installed esptool')
-    proc, port = mock.server.start_server(timeout=30.0, chip=chip)
-    try:
+    with mock_bootloader(chip=chip, timeout=30.0, exit_on_disconnect=False, mode='foreground') as mock:
         with tempfile.TemporaryDirectory() as tmp:
-            bin_file = mock.esptool.create_fake_binary(Path(tmp) / 'test.bin', 1024)
-            wrote_ok, detail = mock.esptool.write_flash_with_stub(
-                chip, str(bin_file), port=port,
+            bin_file = esptool.create_fake_binary(Path(tmp) / 'test.bin', 1024)
+            wrote_ok, detail = esptool.write_flash_with_stub(
+                chip, str(bin_file), port=mock.port(),
             )
             assert wrote_ok, detail
-    finally:
-        mock.server.stop_subprocess(proc)
 
 
 def test_esptool_chip_id(esptool_port, reference_chip):
-    result = mock.esptool.run_esptool(
+    result = esptool.run_esptool(
         '--chip', reference_chip,
-        '--port', f'socket://localhost:{esptool_port}',
+        '--port', esptool_port.url(),
         '--no-stub',
         '--before', 'no-reset',
         '--after', 'no-reset',
@@ -88,15 +85,14 @@ def test_esptool_chip_id(esptool_port, reference_chip):
 
 
 def test_esptool_multiple_binaries(reference_chip):
-    proc, port = mock.server.start_server(timeout=30.0, chip=reference_chip)
-    try:
+    with mock_bootloader(chip=reference_chip, timeout=30.0, exit_on_disconnect=False, mode='foreground') as mock:
         with tempfile.TemporaryDirectory() as tmp:
-            bootloader = mock.esptool.create_fake_binary(Path(tmp) / 'bootloader.bin', 512)
-            partitions = mock.esptool.create_fake_binary(Path(tmp) / 'partitions.bin', 512)
-            app = mock.esptool.create_fake_binary(Path(tmp) / 'app.bin', 2048)
-            result = mock.esptool.run_esptool(
+            bootloader = esptool.create_fake_binary(Path(tmp) / 'bootloader.bin', 512)
+            partitions = esptool.create_fake_binary(Path(tmp) / 'partitions.bin', 512)
+            app = esptool.create_fake_binary(Path(tmp) / 'app.bin', 2048)
+            result = esptool.run_esptool(
                 '--chip', reference_chip,
-                '--port', f'socket://localhost:{port}',
+                '--port', f'socket://localhost:{mock.port()}',
                 '--no-stub',
                 '--before', 'no-reset',
                 '--after', 'no-reset',
@@ -106,63 +102,49 @@ def test_esptool_multiple_binaries(reference_chip):
                 '--flash-size', 'keep',
                 '0x1000', str(bootloader),   # ESP-IDF 2nd-stage bootloader offset
                 '0x8000', str(partitions),   # partition table offset
-                hex(mock.constants.FLASH_APP_OFFSET), str(app),
+                hex(constants.FLASH_APP_OFFSET), str(app),
             )
             assert 'Wrote' in result.stdout, (
                 f'rc={result.returncode}\nstdout: {result.stdout[-500:]}\n'
                 f'stderr: {result.stderr[-300:]}'
             )
-    finally:
-        mock.server.stop_subprocess(proc)
 
 
 
 def test_all_esptool_chips_chip_profiles():
-    for chip in mock.constants.ESPTOOL_CHIPS:
+    for chip in constants.ESPTOOL_CHIPS:
         profile = chips.PROFILES[chip]
-        proc, port = mock.server.start_server(chip=chip)
-        try:
-            sock = mock.server.connect(port)
-            mock.protocol.send_sync(sock)
-
+        with mock_bootloader(chip=chip, exit_on_disconnect=False, mode='foreground') as mock:
+            client = protocol_api.connect(mock)
+            protocol_api.connect(mock).sync()
             if profile.detect_magic:
-                value = mock.protocol.read_reg_value(sock, profile.detect_reg)
+                value = protocol_api.connect(mock).read_reg(profile.detect_reg)
                 assert value == profile.detect_magic, (
                     f'{chip}: expected 0x{profile.detect_magic:08X}, '
                     f'got {None if value is None else f"0x{value:08X}"}'
                 )
-
             efuse_addr = profile.efuse_base + 0x04
-            efuse_value = mock.protocol.read_reg_value(sock, efuse_addr)
+            efuse_value = protocol_api.connect(mock).read_reg(efuse_addr)
             expected = registers.rom_profile(chip).get(efuse_addr, 0)
             assert efuse_value == expected
-
-            assert mock.protocol.minimal_plain_flash(sock)
-            sock.close()
-            sock2 = mock.server.connect(port)
-            assert mock.protocol.minimal_plain_flash(sock2)
-            sock2.close()
-        finally:
-            mock.server.stop_subprocess(proc)
+            assert protocol_api.connect(mock).minimal_plain_flash()
+            assert protocol_api.connect(mock).minimal_plain_flash()
 
 
-@pytest.mark.parametrize('chip', mock.constants.ESPTOOL_CHIPS)
+@pytest.mark.parametrize('chip', constants.ESPTOOL_CHIPS)
 def test_esptool_write_flash_all_esptool_chips(chip: str):
-    proc, port = mock.server.start_server(timeout=30.0, chip=chip)
-    try:
+    with mock_bootloader(chip=chip, timeout=30.0, exit_on_disconnect=False, mode='foreground') as mock:
         with tempfile.TemporaryDirectory() as tmp:
-            bin_file = mock.esptool.create_fake_binary(Path(tmp) / 'test.bin', 1024)
-            wrote_ok, detail = mock.esptool.write_flash_no_stub(
-                chip, str(bin_file), port=port,
+            bin_file = esptool.create_fake_binary(Path(tmp) / 'test.bin', 1024)
+            wrote_ok, detail = esptool.write_flash_no_stub(
+                chip, str(bin_file), port=mock.port(),
             )
             assert wrote_ok, detail
-    finally:
-        mock.server.stop_subprocess(proc)
 
 
 def _make_old_new_pair(tmp: Path, *, change_first_sector: bool = True) -> tuple[Path, Path]:
     # 0xAA fill is arbitrary; 0xBB in first 100 bytes forces a sector diff for --diff-with.
-    old = mock.esptool.create_pattern_binary(tmp / 'old.bin', DIFF_FLASH_SIZE, 0xAA)
+    old = esptool.create_pattern_binary(tmp / 'old.bin', DIFF_FLASH_SIZE, 0xAA)
     new_data = bytearray(old.read_bytes())
     if change_first_sector:
         new_data[0:100] = bytes([0xBB] * 100)
@@ -175,17 +157,17 @@ def test_esptool_diff_with_changed_sectors_no_stub(esptool_port, reference_chip)
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         old, new = _make_old_new_pair(tmp_path)
-        first = mock.esptool.write_flash_at(
-            reference_chip, DIFF_FLASH_ADDR, str(old), port=esptool_port, no_stub=True,
+        first = esptool.write_flash_at(
+            reference_chip, DIFF_FLASH_ADDR, str(old), port=esptool_port.port(), no_stub=True,
         )
         assert first.returncode == 0, first.stderr
-        second = mock.esptool.write_flash_at(
+        second = esptool.write_flash_at(
             reference_chip,
             DIFF_FLASH_ADDR,
             str(new),
-            port=esptool_port,
-            no_stub=True,
+            port=esptool_port.port(),
             diff_with=str(old),
+            no_stub=True,
         )
         assert second.returncode == 0, second.stderr
         assert 'Changed data sectors found' in second.stdout
@@ -195,19 +177,19 @@ def test_esptool_diff_with_changed_sectors_stub(esptool_port, reference_chip):
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         old, new = _make_old_new_pair(tmp_path)
-        first = mock.esptool.write_flash_at(
+        first = esptool.write_flash_at(
             reference_chip,
             DIFF_FLASH_ADDR,
             str(old),
-            port=esptool_port,
+            port=esptool_port.port(),
             extra_args=('-z',),
         )
         assert first.returncode == 0, first.stderr
-        second = mock.esptool.write_flash_at(
+        second = esptool.write_flash_at(
             reference_chip,
             DIFF_FLASH_ADDR,
             str(new),
-            port=esptool_port,
+            port=esptool_port.port(),
             diff_with=str(old),
             extra_args=('-z',),
         )
@@ -220,20 +202,20 @@ def test_esptool_diff_with_identical_sectors_no_stub(esptool_port, reference_chi
         pytest.skip('ESP8266 ROM lacks SPI_FLASH_MD5')
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
-        old = mock.esptool.create_pattern_binary(tmp_path / 'old.bin', DIFF_FLASH_SIZE, 0xCC)  # distinct fill per test
+        old = esptool.create_pattern_binary(tmp_path / 'old.bin', DIFF_FLASH_SIZE, 0xCC)  # distinct fill per test
         new = tmp_path / 'new.bin'
         new.write_bytes(old.read_bytes())
-        first = mock.esptool.write_flash_at(
-            reference_chip, DIFF_FLASH_ADDR, str(old), port=esptool_port, no_stub=True,
+        first = esptool.write_flash_at(
+            reference_chip, DIFF_FLASH_ADDR, str(old), port=esptool_port.port(), no_stub=True,
         )
         assert first.returncode == 0, first.stderr
-        second = mock.esptool.write_flash_at(
+        second = esptool.write_flash_at(
             reference_chip,
             DIFF_FLASH_ADDR,
             str(new),
-            port=esptool_port,
-            no_stub=True,
+            port=esptool_port.port(),
             diff_with=str(old),
+            no_stub=True,
         )
         assert second.returncode == 0, second.stderr
         assert 'No changed sectors found' in second.stdout
@@ -244,22 +226,22 @@ def test_esptool_diff_with_identical_sectors_stub(esptool_port, reference_chip):
     """Second upload with --diff-with skips when daemon flash persists across connections."""
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
-        old = mock.esptool.create_pattern_binary(tmp_path / 'old.bin', DIFF_FLASH_SIZE, 0xCE)
+        old = esptool.create_pattern_binary(tmp_path / 'old.bin', DIFF_FLASH_SIZE, 0xCE)
         new = tmp_path / 'new.bin'
         new.write_bytes(old.read_bytes())
-        first = mock.esptool.write_flash_at(
+        first = esptool.write_flash_at(
             reference_chip,
             DIFF_FLASH_ADDR,
             str(old),
-            port=esptool_port,
+            port=esptool_port.port(),
             extra_args=('-z',),
         )
         assert first.returncode == 0, first.stderr
-        second = mock.esptool.write_flash_at(
+        second = esptool.write_flash_at(
             reference_chip,
             DIFF_FLASH_ADDR,
             str(new),
-            port=esptool_port,
+            port=esptool_port.port(),
             diff_with=str(old),
             extra_args=('-z',),
         )
@@ -274,18 +256,18 @@ def test_esptool_diff_with_trust_flash_content_no_stub(esptool_port, reference_c
         pytest.skip('ESP8266 ROM lacks SPI_FLASH_MD5')
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
-        old = mock.esptool.create_pattern_binary(tmp_path / 'old.bin', DIFF_FLASH_SIZE, 0xDD)  # distinct fill per test
+        old = esptool.create_pattern_binary(tmp_path / 'old.bin', DIFF_FLASH_SIZE, 0xDD)  # distinct fill per test
         new = tmp_path / 'new.bin'
         new.write_bytes(old.read_bytes())
-        first = mock.esptool.write_flash_at(
-            reference_chip, DIFF_FLASH_ADDR, str(old), port=esptool_port, no_stub=True,
+        first = esptool.write_flash_at(
+            reference_chip, DIFF_FLASH_ADDR, str(old), port=esptool_port.port(), no_stub=True,
         )
         assert first.returncode == 0, first.stderr
-        second = mock.esptool.write_flash_at(
+        second = esptool.write_flash_at(
             reference_chip,
             DIFF_FLASH_ADDR,
             str(new),
-            port=esptool_port,
+            port=esptool_port.port(),
             no_stub=True,
             diff_with=str(old),
             trust_flash_content=True,
@@ -300,16 +282,16 @@ def test_esptool_diff_with_fallback_full_reflash_no_stub(esptool_port, reference
         tmp_path = Path(tmp)
         old, new = _make_old_new_pair(tmp_path)
         # Stage flash with 0xEE so MD5 differs from --diff-with reference (0xAA), forcing full reflash.
-        different = mock.esptool.create_pattern_binary(tmp_path / 'different.bin', DIFF_FLASH_SIZE, 0xEE)
-        staged = mock.esptool.write_flash_at(
-            reference_chip, DIFF_FLASH_ADDR, str(different), port=esptool_port, no_stub=True,
+        different = esptool.create_pattern_binary(tmp_path / 'different.bin', DIFF_FLASH_SIZE, 0xEE)
+        staged = esptool.write_flash_at(
+            reference_chip, DIFF_FLASH_ADDR, str(different), port=esptool_port.port(), no_stub=True,
         )
         assert staged.returncode == 0, staged.stderr
-        result = mock.esptool.write_flash_at(
+        result = esptool.write_flash_at(
             reference_chip,
             DIFF_FLASH_ADDR,
             str(new),
-            port=esptool_port,
+            port=esptool_port.port(),
             no_stub=True,
             diff_with=str(old),
         )
@@ -319,35 +301,30 @@ def test_esptool_diff_with_fallback_full_reflash_no_stub(esptool_port, reference
             or 'Verification failed after fast reflash' in result.stdout
             or 'flashing the whole image' in result.stdout
         )
-pytestmark = pytest.mark.esptool
 
 
-@pytest.mark.parametrize('chip', mock.constants.ESPTOOL_CHIPS)
+@pytest.mark.parametrize('chip', constants.ESPTOOL_CHIPS)
 def test_flash_id_matching_chip_no_protocol_warnings(chip: str):
-    proc, port = mock.server.start_server(timeout=60.0, chip=chip)
-    try:
-        result = mock.esptool.run_flash_id(chip, port=port)
+    with mock_bootloader(chip=chip, timeout=60.0, exit_on_disconnect=False, mode='foreground') as mock:
+        result = esptool.run_flash_id(chip, port=mock.port())
         output = result.stdout + result.stderr
         assert result.returncode == 0, output[-800:]
-        warns = mock.esptool.forbidden_warnings(output, transport='socket')
+        warns = esptool.forbidden_warnings(output, transport='socket')
         assert warns == [], '\n'.join(warns)
         mac = registers.mac_bytes_for_chip(chip)
         mac_line = ':'.join(f'{b:02x}' for b in mac)
         assert mac_line in output
-    finally:
-        mock.server.stop_subprocess(proc)
 
 
 @pytest.mark.parametrize('chip', ('esp32', 'esp32c3', 'esp8266'))
 def test_flash_id_esptool_auto_detects_fixed_mock(chip: str):
     """esptool --chip auto uses ROM probes; mock --chip X must match the virtual SoC."""
-    if chip not in mock.constants.ESPTOOL_CHIPS:
+    if chip not in constants.ESPTOOL_CHIPS:
         pytest.skip(f'{chip} not supported by installed esptool')
-    proc, port = mock.server.start_server(timeout=60.0, chip=chip)
-    try:
-        result = mock.esptool.run_esptool(
+    with mock_bootloader(chip=chip, timeout=60.0, exit_on_disconnect=False, mode='foreground') as mock:
+        result = esptool.run_esptool(
             '--chip', 'auto',
-            '--port', f'socket://localhost:{port}',
+            '--port', f'socket://localhost:{mock.port()}',
             '--before', 'no-reset',
             '--after', 'no-reset',
             '--no-stub',
@@ -356,26 +333,8 @@ def test_flash_id_esptool_auto_detects_fixed_mock(chip: str):
         )
         output = result.stdout + result.stderr
         assert result.returncode == 0, output[-800:]
-        warns = mock.esptool.forbidden_warnings(output, transport='socket')
+        warns = esptool.forbidden_warnings(output, transport='socket')
         assert warns == [], '\n'.join(warns)
         mac = registers.mac_bytes_for_chip(chip)
         mac_line = ':'.join(f'{b:02x}' for b in mac)
         assert mac_line in output
-    finally:
-        mock.server.stop_subprocess(proc)
-
-
-@pytest.mark.transport
-@pytest.mark.parametrize('chip', ('esp32', 'esp32c3'))
-def test_flash_id_pty_no_protocol_warnings(chip: str, tmp_path: Path):
-    path_file = tmp_path / 'mock.pty'
-    proc = mock.server.start_pty(path_file, timeout=30.0, chip=chip, exit_on_disconnect=True)
-    try:
-        pty_path = mock.server.read_pty_path(path_file)
-        result = mock.esptool.run_flash_id(chip, pty_path=pty_path)
-        output = result.stdout + result.stderr
-        assert result.returncode == 0, output[-800:]
-        warns = mock.esptool.forbidden_warnings(output, transport='pty')
-        assert warns == [], '\n'.join(warns)
-    finally:
-        mock.server.stop_subprocess(proc)

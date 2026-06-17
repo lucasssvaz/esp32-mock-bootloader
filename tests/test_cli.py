@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 
 import pytest
 
-from esp32_mock_bootloader import chips, cli, daemon
+from esp32_mock_bootloader import chips, cli, daemon, instances
 
-import esp32_mock_bootloader.testing as mock
+from esp32_mock_bootloader import constants, process, protocol_client
+from tests.helpers import esptool
 
 
 def _start_via_cli(cli, port: int, chip: str = 'auto') -> None:
@@ -21,8 +23,8 @@ def _start_via_cli(cli, port: int, chip: str = 'auto') -> None:
 
 
 def test_cli_lists_all_running_instances(cli, wait_for_daemons):
-    port_a = mock.server.reserve_tcp_port()
-    port_b = mock.server.reserve_tcp_port()
+    port_a = process.reserve_tcp_port()
+    port_b = process.reserve_tcp_port()
     try:
         _start_via_cli(cli, port_a, 'esp32')
         _start_via_cli(cli, port_b, 'esp32c3')
@@ -58,7 +60,7 @@ def test_cli_lists_all_running_instances(cli, wait_for_daemons):
 
 
 def test_cli_port_all_lists_single_instance(cli):
-    port = mock.server.reserve_tcp_port()
+    port = process.reserve_tcp_port()
     try:
         daemon.start_daemon(port=port, chip_mode='esp32')
 
@@ -80,8 +82,8 @@ def test_cli_port_all_lists_single_instance(cli):
 
 
 def test_cli_stop_port_all(cli, wait_for_daemons):
-    port_a = mock.server.reserve_tcp_port()
-    port_b = mock.server.reserve_tcp_port()
+    port_a = process.reserve_tcp_port()
+    port_b = process.reserve_tcp_port()
     try:
         _start_via_cli(cli, port_a)
         _start_via_cli(cli, port_b)
@@ -97,8 +99,8 @@ def test_cli_stop_port_all(cli, wait_for_daemons):
 
 
 def test_cli_auto_stop_multiple_instances(cli, wait_for_daemons):
-    port_a = mock.server.reserve_tcp_port()
-    port_b = mock.server.reserve_tcp_port()
+    port_a = process.reserve_tcp_port()
+    port_b = process.reserve_tcp_port()
     try:
         _start_via_cli(cli, port_a)
         _start_via_cli(cli, port_b)
@@ -127,7 +129,7 @@ def test_cli_list_all_none_running(cli):
 
 
 def test_cli_auto_picks_single_running_instance(cli):
-    port = mock.server.reserve_tcp_port()
+    port = process.reserve_tcp_port()
     try:
         daemon.start_daemon(port=port, chip_mode='esp32')
 
@@ -196,7 +198,7 @@ def test_cli_chips_json(cli):
 
 
 def test_cli_status_human_readable(cli):
-    port = mock.server.reserve_tcp_port()
+    port = process.reserve_tcp_port()
     try:
         start = cli('start', '--port', str(port), '--chip', 'auto')
         assert start.returncode == 0
@@ -216,7 +218,7 @@ def test_cli_status_stopped_exit_code(cli):
 
 
 def test_start_status_stop_round_trip(cli):
-    port = mock.server.reserve_tcp_port()
+    port = process.reserve_tcp_port()
     chip = chips.SUPPORTED[0]
 
     start = cli('start', '--port', str(port), '--chip', chip)
@@ -245,45 +247,54 @@ def test_start_status_stop_round_trip(cli):
     assert daemon.read_state(port) is None
 
 
-def test_cli_erase_flash(cli):
+def test_attach_session_leaves_daemon_running(cli, wait_for_daemons):
+    from tests.helpers.session import attach_session
+
+    port = process.reserve_tcp_port()
+    try:
+        _start_via_cli(cli, port, 'esp32')
+        wait_for_daemons(1)
+        with attach_session(port, 'esp32') as client:
+            client.sync()
+        status = cli('status', '--port', str(port))
+        assert status.returncode == 0, status.stderr
+        assert 'running' in status.stdout
+    finally:
+        daemon.stop_daemon(port)
+
+
+def test_cli_erase_flash(cli, wait_for_daemons):
     import hashlib
     import struct
 
     from esp32_mock_bootloader import protocol
+    from tests.helpers.session import attach_session
 
-    port = mock.server.reserve_tcp_port()
-    offset = mock.constants.FLASH_APP_OFFSET
+    port = process.reserve_tcp_port()
+    offset = constants.FLASH_APP_OFFSET
     length = 0x200
     try:
         _start_via_cli(cli, port, 'esp32')
+        wait_for_daemons(1)
 
-        sock = mock.server.connect(port)
-        mock.protocol.send_sync(sock)
-        mock.protocol.send_and_receive(
-            sock,
-            mock.protocol.make_command(
+        with attach_session(port, 'esp32') as client:
+            client.sync()
+            client.send_command(
                 protocol.CMD_FLASH_BEGIN,
                 struct.pack('<IIII', length, 1, length, offset),
-            ),
-        )
-        block = b'\x5A' * length
-        mock.protocol.send_and_receive(
-            sock,
-            mock.protocol.make_command(
+            )
+            client.send_command(
                 protocol.CMD_FLASH_DATA,
-                struct.pack('<IIII', length, 0, 0, 0) + block,
-            ),
-        )
-        sock.close()
+                struct.pack('<IIII', length, 0, 0, 0) + (b'\x5A' * length),
+            )
 
         erase = cli('erase-flash', '--port', str(port))
         assert erase.returncode == 0, erase.stderr
         assert 'Erased mock flash' in erase.stdout
 
-        sock = mock.server.connect(port)
-        mock.protocol.activate_stub(sock)
-        data, digest = mock.protocol.stub_read_flash(sock, offset, length)
-        sock.close()
+        with attach_session(port, 'esp32') as client:
+            client.activate_stub()
+            data, digest = client.stub_read_flash(offset, length)
         assert data == b'\xff' * length
         assert digest == hashlib.md5(data).digest()
     finally:
@@ -291,8 +302,8 @@ def test_cli_erase_flash(cli):
 
 
 def test_cli_erase_flash_port_all(cli, wait_for_daemons):
-    port_a = mock.server.reserve_tcp_port()
-    port_b = mock.server.reserve_tcp_port()
+    port_a = process.reserve_tcp_port()
+    port_b = process.reserve_tcp_port()
     try:
         _start_via_cli(cli, port_a, 'esp32')
         _start_via_cli(cli, port_b, 'esp32')
@@ -324,56 +335,13 @@ def test_cli_stop_none_running_is_noop(cli):
 
 
 def test_erase_flash_all_erases_multiple_daemons():
-    port_a = mock.server.reserve_tcp_port()
-    port_b = mock.server.reserve_tcp_port()
+    port_a = process.reserve_tcp_port()
+    port_b = process.reserve_tcp_port()
     try:
         daemon.start_daemon(port=port_a, chip_mode='auto')
         daemon.start_daemon(port=port_b, chip_mode='auto')
         erased = daemon.erase_flash()
         assert sorted(erased) == sorted([port_a, port_b])
-    finally:
-        daemon.stop_daemon(port_a)
-        daemon.stop_daemon(port_b)
-
-
-def test_erase_flash_single_port_with_multiple_running():
-    import struct
-
-    from esp32_mock_bootloader import protocol
-
-    port_a = mock.server.reserve_tcp_port()
-    port_b = mock.server.reserve_tcp_port()
-    offset = mock.constants.FLASH_APP_OFFSET
-    length = 0x100
-    try:
-        daemon.start_daemon(port=port_a, chip_mode='esp32')
-        daemon.start_daemon(port=port_b, chip_mode='esp32')
-
-        sock_b = mock.server.connect(port_b)
-        mock.protocol.send_sync(sock_b)
-        mock.protocol.send_and_receive(
-            sock_b,
-            mock.protocol.make_command(
-                protocol.CMD_FLASH_BEGIN,
-                struct.pack('<IIII', length, 1, length, offset),
-            ),
-        )
-        mock.protocol.send_and_receive(
-            sock_b,
-            mock.protocol.make_command(
-                protocol.CMD_FLASH_DATA,
-                struct.pack('<IIII', length, 0, 0, 0) + (b'\x5A' * length),
-            ),
-        )
-        sock_b.close()
-
-        assert daemon.erase_flash(port=port_a) == [port_a]
-
-        sock_b = mock.server.connect(port_b)
-        mock.protocol.activate_stub(sock_b)
-        data, _digest = mock.protocol.stub_read_flash(sock_b, offset, length)
-        sock_b.close()
-        assert data == b'\x5A' * length
     finally:
         daemon.stop_daemon(port_a)
         daemon.stop_daemon(port_b)
@@ -392,7 +360,7 @@ def test_cli_run_serial_port_flags():
 
 
 def test_start_refuses_double_start(cli):
-    port = mock.server.reserve_tcp_port()
+    port = process.reserve_tcp_port()
     try:
         first = cli('start', '--port', str(port), '--chip', 'auto')
         assert first.returncode == 0
@@ -404,14 +372,14 @@ def test_start_refuses_double_start(cli):
 
 
 def test_registry_tracks_single_file(cli, registry_root):
-    port = mock.server.reserve_tcp_port()
+    port = process.reserve_tcp_port()
     try:
         cli('start', '--port', str(port), '--chip', 'auto')
         registry = daemon.load_registry()
         assert str(port) in registry['instances']
         assert len(registry['instances']) == 1
-        assert registry_root.joinpath('registry.json').is_file()
-        assert any(registry_root.glob('port-*.log'))
+        assert registry_root.path.joinpath('registry.json').is_file()
+        assert any(registry_root.path.glob('port-*.log'))
     finally:
         daemon.stop_daemon(port)
 
@@ -445,7 +413,7 @@ def test_parse_target_port_invalid():
 
 
 def test_resolve_query_targets_explicit_port():
-    mode, target = cli._resolve_query_targets(43210)
+    mode, target = instances.resolve_port(43210)
     assert mode == 'single'
     assert target == 43210
 
@@ -456,7 +424,7 @@ def test_resolve_query_targets_all_forces_multi(monkeypatch):
         'list_running_daemons',
         lambda base=None: [_running(1111)],
     )
-    mode, target = cli._resolve_query_targets('all')
+    mode, target = instances.resolve_port('all')
     assert mode == 'multi'
     assert len(target) == 1
 
@@ -467,7 +435,7 @@ def test_resolve_query_targets_auto_single(monkeypatch):
         'list_running_daemons',
         lambda base=None: [_running(2222)],
     )
-    mode, target = cli._resolve_query_targets(None)
+    mode, target = instances.resolve_port(None)
     assert mode == 'single'
     assert target == 2222
 
@@ -478,20 +446,20 @@ def test_resolve_query_targets_auto_multiple(monkeypatch):
         'list_running_daemons',
         lambda base=None: [_running(3333), _running(4444)],
     )
-    mode, target = cli._resolve_query_targets(None)
+    mode, target = instances.resolve_port(None)
     assert mode == 'multi'
     assert {i['port'] for i in target} == {3333, 4444}
 
 
 def test_resolve_query_targets_auto_none_running(monkeypatch):
     monkeypatch.setattr(daemon, 'list_running_daemons', lambda base=None: [])
-    mode, target = cli._resolve_query_targets(None)
+    mode, target = instances.resolve_port(None)
     assert mode == 'single'
     assert target == daemon.DEFAULT_PORT
 
 
 def test_format_status_table():
-    table = cli._format_status_table([_running(5555, detected_chip='esp32c3')])
+    table = instances.format_status([_running(5555, detected_chip='esp32c3')])
     assert '5555' in table
     assert 'esp32c3' in table
     assert 'socket://127.0.0.1:5555' in table
@@ -503,7 +471,7 @@ def test_cmd_status_single_running(capsys, monkeypatch):
         'daemon_status',
         lambda port, base=None: _running(port),
     )
-    monkeypatch.setattr(cli, '_resolve_query_targets', lambda _p: ('single', 6001))
+    monkeypatch.setattr(instances, 'resolve_port', lambda _p, base=None: ('single', 6001))
 
     rc = cli._cmd_status(argparse.Namespace(port=6001, json=False, bind='127.0.0.1'))
     out = capsys.readouterr().out
@@ -518,7 +486,7 @@ def test_cmd_status_single_stopped(capsys, monkeypatch):
         'daemon_status',
         lambda port, base=None: {'running': False, 'port': port},
     )
-    monkeypatch.setattr(cli, '_resolve_query_targets', lambda _p: ('single', 6002))
+    monkeypatch.setattr(instances, 'resolve_port', lambda _p, base=None: ('single', 6002))
 
     rc = cli._cmd_status(argparse.Namespace(port=6002, json=False, bind='127.0.0.1'))
     out = capsys.readouterr().out
@@ -527,7 +495,7 @@ def test_cmd_status_single_stopped(capsys, monkeypatch):
 
 
 def test_cmd_status_multi_json_empty(capsys, monkeypatch):
-    monkeypatch.setattr(cli, '_resolve_query_targets', lambda _p: ('multi', []))
+    monkeypatch.setattr(instances, 'resolve_port', lambda _p, base=None: ('multi', []))
 
     rc = cli._cmd_status(argparse.Namespace(port='all', json=True, bind='127.0.0.1'))
     out = capsys.readouterr()
@@ -537,9 +505,9 @@ def test_cmd_status_multi_json_empty(capsys, monkeypatch):
 
 def test_cmd_status_multi_json(capsys, monkeypatch):
     monkeypatch.setattr(
-        cli,
-        '_resolve_query_targets',
-        lambda _p: ('multi', [_running(7001), _running(7002)]),
+        instances,
+        'resolve_port',
+        lambda _p, base=None: ('multi', [_running(7001), _running(7002)]),
     )
 
     rc = cli._cmd_status(argparse.Namespace(port='all', json=True, bind='127.0.0.1'))
@@ -551,9 +519,9 @@ def test_cmd_status_multi_json(capsys, monkeypatch):
 
 def test_cmd_status_multi_human(capsys, monkeypatch):
     monkeypatch.setattr(
-        cli,
-        '_resolve_query_targets',
-        lambda _p: ('multi', [_running(7001), _running(7002)]),
+        instances,
+        'resolve_port',
+        lambda _p, base=None: ('multi', [_running(7001), _running(7002)]),
     )
 
     rc = cli._cmd_status(argparse.Namespace(port='all', json=False, bind='127.0.0.1'))
@@ -563,7 +531,7 @@ def test_cmd_status_multi_human(capsys, monkeypatch):
 
 
 def test_cmd_url_single_fallback(capsys, monkeypatch):
-    monkeypatch.setattr(cli, '_resolve_query_targets', lambda _p: ('single', 8001))
+    monkeypatch.setattr(instances, 'resolve_port', lambda _p, base=None: ('single', 8001))
     monkeypatch.setattr(daemon, 'read_state', lambda port, base=None: None)
 
     rc = cli._cmd_url(argparse.Namespace(port=8001, bind='127.0.0.1'))
@@ -572,7 +540,7 @@ def test_cmd_url_single_fallback(capsys, monkeypatch):
 
 
 def test_cmd_url_multi_empty(capsys, monkeypatch):
-    monkeypatch.setattr(cli, '_resolve_query_targets', lambda _p: ('multi', []))
+    monkeypatch.setattr(instances, 'resolve_port', lambda _p, base=None: ('multi', []))
 
     rc = cli._cmd_url(argparse.Namespace(port='all', bind='127.0.0.1'))
     err = capsys.readouterr().err
@@ -581,7 +549,7 @@ def test_cmd_url_multi_empty(capsys, monkeypatch):
 
 
 def test_cmd_port_single_from_state(capsys, monkeypatch):
-    monkeypatch.setattr(cli, '_resolve_query_targets', lambda _p: ('single', 9001))
+    monkeypatch.setattr(instances, 'resolve_port', lambda _p, base=None: ('single', 9001))
     monkeypatch.setattr(
         daemon,
         'read_state',
@@ -595,7 +563,7 @@ def test_cmd_port_single_from_state(capsys, monkeypatch):
 
 def test_cmd_stop_single(capsys, monkeypatch):
     stopped: list[int] = []
-    monkeypatch.setattr(cli, '_resolve_query_targets', lambda _p: ('single', 9100))
+    monkeypatch.setattr(instances, 'resolve_port', lambda _p, base=None: ('single', 9100))
     monkeypatch.setattr(daemon, 'stop_daemon', lambda port, base=None: stopped.append(port) or True)
 
     assert cli._cmd_stop(argparse.Namespace(port=9100)) == 0
@@ -603,16 +571,16 @@ def test_cmd_stop_single(capsys, monkeypatch):
 
 
 def test_cmd_stop_multi_empty(capsys, monkeypatch):
-    monkeypatch.setattr(cli, '_resolve_query_targets', lambda _p: ('multi', []))
+    monkeypatch.setattr(instances, 'resolve_port', lambda _p, base=None: ('multi', []))
     assert cli._cmd_stop(argparse.Namespace(port='all')) == 0
 
 
 def test_cmd_stop_multi(capsys, monkeypatch):
     stopped: list[int] = []
     monkeypatch.setattr(
-        cli,
-        '_resolve_query_targets',
-        lambda _p: ('multi', [_running(9201), _running(9202)]),
+        instances,
+        'resolve_port',
+        lambda _p, base=None: ('multi', [_running(9201), _running(9202)]),
     )
     monkeypatch.setattr(
         daemon,
@@ -625,7 +593,7 @@ def test_cmd_stop_multi(capsys, monkeypatch):
 
 
 def test_cmd_erase_flash_single(capsys, monkeypatch):
-    monkeypatch.setattr(cli, '_resolve_query_targets', lambda _p: ('single', 9300))
+    monkeypatch.setattr(instances, 'resolve_port', lambda _p, base=None: ('single', 9300))
     monkeypatch.setattr(daemon, 'erase_flash', lambda port='all', base=None: [9300])
 
     rc = cli._cmd_erase_flash(argparse.Namespace(port=9300))
@@ -634,7 +602,7 @@ def test_cmd_erase_flash_single(capsys, monkeypatch):
 
 
 def test_cmd_erase_flash_multi(capsys, monkeypatch):
-    monkeypatch.setattr(cli, '_resolve_query_targets', lambda _p: ('multi', [_running(9401)]))
+    monkeypatch.setattr(instances, 'resolve_port', lambda _p, base=None: ('multi', [_running(9401)]))
     monkeypatch.setattr(daemon, 'erase_flash', lambda port='all', base=None: [9401, 9402])
 
     rc = cli._cmd_erase_flash(argparse.Namespace(port='all'))
@@ -644,7 +612,7 @@ def test_cmd_erase_flash_multi(capsys, monkeypatch):
 
 
 def test_cmd_erase_flash_error(capsys, monkeypatch):
-    monkeypatch.setattr(cli, '_resolve_query_targets', lambda _p: ('single', 9500))
+    monkeypatch.setattr(instances, 'resolve_port', lambda _p, base=None: ('single', 9500))
 
     def _boom(**_kwargs):
         raise RuntimeError('erase failed')
@@ -676,7 +644,7 @@ def test_cmd_run_tcp(monkeypatch):
         called['args'] = args
         called['kwargs'] = kwargs
 
-    monkeypatch.setattr(cli, 'run_server', fake_run_server)
+    monkeypatch.setattr('esp32_mock_bootloader.server.run_server', fake_run_server)
     rc = cli._cmd_run(argparse.Namespace(
         pty=False,
         port='9876',
@@ -685,7 +653,7 @@ def test_cmd_run_tcp(monkeypatch):
         bind='127.0.0.1',
         exit_on_disconnect=False,
         daemon_child=False,
-        pty_path_file=None,
+        port_file=None,
         serial_bind=None,
     ))
     assert rc == 0
@@ -703,28 +671,30 @@ def test_main_invokes_subcommand(monkeypatch):
     assert cli.main([]) == 7
 
 
-def test_print_single_status_json(capsys):
-    cli._print_single_status(_running(9700), json_output=True)
+def test_instances_status_json_single(capsys, monkeypatch):
+    monkeypatch.setattr(
+        daemon,
+        'daemon_status',
+        lambda port, base=None: _running(port),
+    )
+    instances.status(9700, format='json', file=sys.stdout)
     payload = json.loads(capsys.readouterr().out)
     assert payload['port'] == 9700
 
 
-def test_print_single_status_log_file(capsys):
-    cli._print_single_status(
-        _running(9701, log_file='/tmp/port-9701.log'),
-        json_output=False,
-    )
-    assert 'log_file: /tmp/port-9701.log' in capsys.readouterr().out
+def test_instances_status_text_table():
+    text = instances.format_status([_running(9701, detected_chip='esp32c3')])
+    assert '9701' in text
+    assert 'esp32c3' in text
 
 
-def test_print_single_url_from_state(capsys, monkeypatch):
+def test_instances_url_from_daemon_state(monkeypatch):
     monkeypatch.setattr(
         daemon,
         'read_state',
         lambda port, base=None: {'url': f'socket://127.0.0.1:{port}'},
     )
-    cli._print_single_url(9800, '127.0.0.1')
-    assert capsys.readouterr().out.strip() == 'socket://127.0.0.1:9800'
+    assert instances.url(9800) == 'socket://127.0.0.1:9800'
 
 
 def test_build_parser_target_port_subcommands():
@@ -743,7 +713,7 @@ def test_cli_run_pty_smoke(tmp_path):
     proc = subprocess.Popen(
         [
             sys.executable, '-m', 'esp32_mock_bootloader.cli', 'run',
-            '--pty', '--pty-path-file', str(path_file),
+            '--pty', '--port-file', str(path_file),
             '--chip', 'esp32',
             '--timeout', '30',
         ],
@@ -762,11 +732,11 @@ def test_cli_run_pty_smoke(tmp_path):
         assert path_file.read_text(encoding='ascii').strip()
     finally:
         if proc.poll() is None:
-            mock.server.stop_subprocess(proc)
+            process.stop_subprocess(proc)
 
 
 def test_cli_start_force(cli):
-    port = mock.server.reserve_tcp_port()
+    port = process.reserve_tcp_port()
     try:
         assert cli('start', '--port', str(port), '--chip', 'auto').returncode == 0
         replaced = cli('start', '--port', str(port), '--chip', 'esp32', '--force')

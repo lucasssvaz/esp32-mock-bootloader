@@ -23,7 +23,8 @@ import time
 from pathlib import Path
 
 from esp32_mock_bootloader.com0com import Com0ComError, com0com_pair
-import esp32_mock_bootloader.testing as mock
+from esp32_mock_bootloader import constants, protocol_client
+from tests.helpers import esptool
 
 COM_BIND = os.environ.get('ESP32_MOCK_SERIAL_BIND') or os.environ.get('ESP32_MOCK_COM_PORT', 'COM18')
 COM_PORT = os.environ.get('ESP32_MOCK_PORT') or os.environ.get('ESP32_MOCK_COM_PEER', 'COM19')
@@ -55,7 +56,7 @@ def _run_flash_test(serial_bind: str, client_port: str) -> int:
             [
                 sys.executable, '-m', 'esp32_mock_bootloader.cli', 'run',
                 '--pty',
-                '--pty-path-file', str(path_file),
+                '--port-file', str(path_file),
                 '--port', client_port,
                 '--chip', 'esp32',
                 '--timeout', '120',
@@ -111,7 +112,7 @@ def _run_flash_test(serial_bind: str, client_port: str) -> int:
                 print('VID/PID lines (expected on com0com):')
                 for line in vid_pid_lines:
                     print(f'  {line}')
-            warns = mock.esptool.forbidden_warnings(fid_output, transport='pty')
+            warns = esptool.forbidden_warnings(fid_output, transport='pty')
             if warns:
                 return _fail('Unexpected esptool warnings on flash-id:\n' + '\n'.join(warns))
 

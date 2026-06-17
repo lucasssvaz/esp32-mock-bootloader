@@ -50,17 +50,18 @@ only-include = ["src", "README.md", "LICENSE", "pyproject.toml"]
 # without this, its record_xml_attribute hook warns on every test.
 # -n auto: parallel workers (requires pytest-xdist from .[test]); use pytest -n0 to disable.
 addopts = ["-p", "no:embedded", "-n", "auto"]
+pythonpath = ["."]
 markers = [
     "esptool: integration tests that invoke the esptool CLI",
     "transport: TCP and PTY transport integration tests",
     "com0com: Windows com0com integration (requires admin + setupc)",
+    "advanced: opt-in transport/process/protocol building blocks",
 ]
 testpaths = ["tests"]
 
 [tool.coverage.run]
 source_pkgs = ["esp32_mock_bootloader"]
 omit = [
-    "*/esp32_mock_bootloader/testing/*",
 ]
 data_file = "reports/.coverage"
 parallel = true

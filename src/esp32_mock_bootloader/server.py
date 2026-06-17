@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -631,7 +632,13 @@ class PtyMasterTransport:
         ready, _, _ = select.select([self._master], [], [], self._timeout)
         if not ready:
             raise socket.timeout()
-        chunk = os.read(self._master, size)
+        try:
+            chunk = os.read(self._master, size)
+        except OSError as exc:
+            # Linux reports PTY hangup as EIO once all slave fds are closed.
+            if exc.errno != errno.EIO:
+                raise
+            return b''
         if chunk:
             self._on_client_data()
         return chunk
@@ -1036,26 +1043,38 @@ def run_server(
     *,
     exit_on_disconnect: bool = False,
     track_registry: bool = False,
+    port_file: str | None = None,
 ) -> None:
     from esp32_mock_bootloader import daemon
 
-    on_detected = _make_on_detected(port)
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        srv.bind((bind, port))
+    except OSError:
+        if port == 0:
+            raise
+        srv.bind((bind, 0))
+    srv.listen(1)
+    actual_port = srv.getsockname()[1]
+
+    if port_file:
+        with open(port_file, 'w', encoding='ascii') as f:
+            f.write(str(actual_port))
+
+    on_detected = _make_on_detected(actual_port)
     if track_registry:
-        daemon.register_instance(port, {
+        daemon.register_instance(actual_port, {
             'pid': os.getpid(),
-            'port': port,
+            'port': actual_port,
             'chip': chip_mode,
             'bind': bind,
-            'url': daemon.socket_url(port, bind),
+            'url': daemon.socket_url(actual_port, bind),
             'log_file': None,
             'detected_chip': None,
             'mode': 'foreground',
         })
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((bind, port))
-    srv.listen(1)
-    label = f'Mock bootloader (chip={chip_mode}) listening on {bind}:{port}'
+    label = f'Mock bootloader (chip={chip_mode}) listening on {bind}:{actual_port}'
     try:
         _tcp_listen_loop(
             srv, timeout, chip_mode, on_detected, label,
@@ -1063,19 +1082,19 @@ def run_server(
         )
     finally:
         if track_registry:
-            daemon.unregister_instance(port)
+            daemon.unregister_instance(actual_port)
 
 
 def _run_unix_pty_server(
     timeout: float | None,
-    pty_path_file: str | None,
+    port_file: str | None,
     chip_mode: str,
     on_detected: Callable[[str | None], None] | None,
     *,
     exit_on_disconnect: bool = False,
 ) -> None:
     pty_transport = PtyMasterTransport.create(track_disconnect=exit_on_disconnect)
-    _write_serial_endpoint(pty_path_file, pty_transport.client_path)
+    _write_serial_endpoint(port_file, pty_transport.client_path)
     print(
         f'Mock bootloader (chip={chip_mode}) on PTY {pty_transport.client_path}',
         flush=True,
@@ -1150,7 +1169,7 @@ def _run_com_server(
     serial_bind: str,
     client_port: str,
     timeout: float | None,
-    pty_path_file: str | None,
+    port_file: str | None,
     chip_mode: str,
     on_detected: Callable[[str | None], None] | None,
     *,
@@ -1163,7 +1182,7 @@ def _run_com_server(
     """
     import serial
 
-    _write_serial_endpoint(pty_path_file, client_port)
+    _write_serial_endpoint(port_file, client_port)
     print(
         f'Mock bootloader (chip={chip_mode}) on {serial_bind} (client: {client_port})',
         flush=True,
@@ -1191,7 +1210,7 @@ def _run_com_server(
 
 def _run_windows_pty_server(
     timeout: float | None,
-    pty_path_file: str | None,
+    port_file: str | None,
     chip_mode: str,
     on_detected: Callable[[str | None], None] | None,
     *,
@@ -1204,7 +1223,7 @@ def _run_windows_pty_server(
     port = srv.getsockname()[1]
     srv.listen(1)
     endpoint = f'socket://127.0.0.1:{port}'
-    _write_serial_endpoint(pty_path_file, endpoint)
+    _write_serial_endpoint(port_file, endpoint)
     _tcp_listen_loop(
         srv, timeout, chip_mode, on_detected,
         f'Mock bootloader (chip={chip_mode}) on {endpoint} (Windows socket fallback)',
@@ -1214,7 +1233,7 @@ def _run_windows_pty_server(
 
 def run_pty_server(
     timeout: float | None,
-    pty_path_file: str | None,
+    port_file: str | None,
     chip_mode: str = 'auto',
     *,
     client_port: str | None = None,
@@ -1225,16 +1244,16 @@ def run_pty_server(
     com_pair = resolve_serial_pair(client_port, serial_bind)
     if com_pair is not None:
         _run_com_server(
-            *com_pair, timeout, pty_path_file, chip_mode, on_detected,
+            *com_pair, timeout, port_file, chip_mode, on_detected,
             exit_on_disconnect=exit_on_disconnect,
         )
     elif os.name == 'nt':
         _run_windows_pty_server(
-            timeout, pty_path_file, chip_mode, on_detected,
+            timeout, port_file, chip_mode, on_detected,
             exit_on_disconnect=exit_on_disconnect,
         )
     else:
         _run_unix_pty_server(
-            timeout, pty_path_file, chip_mode, on_detected,
+            timeout, port_file, chip_mode, on_detected,
             exit_on_disconnect=exit_on_disconnect,
         )
