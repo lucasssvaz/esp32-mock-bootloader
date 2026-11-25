@@ -217,7 +217,7 @@ def test_handle_client_flash_end_idle_disconnect(bootloader_client):
 
 def test_handle_client_multifile_flash_does_not_disconnect_mid_session(monkeypatch):
     """Regression: FLASH_DEFL_END(stay_in_loader=1) between files must not trigger idle disconnect."""
-    monkeypatch.setattr(server, '_FLASH_END_IDLE_SEC', 0.25)
+    monkeypatch.setattr(server, '_FLASH_END_IDLE_SEC', 1.0)
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(('127.0.0.1', 0))
@@ -252,14 +252,14 @@ def test_handle_client_multifile_flash_does_not_disconnect_mid_session(monkeypat
             client,
             protocol_client.make_command(protocol.CMD_FLASH_DEFL_END, struct.pack('<I', 1)),
         )
-        time.sleep(0.15)
+        time.sleep(0.05)
         protocol_client.send_and_receive(
             client,
             protocol_client.make_command(protocol.CMD_SPI_FLASH_MD5, struct.pack('<IIII', 0x0, len(file1), 0, 0)),
         )
 
         # File 2 starts before idle expires, then takes longer than _FLASH_END_IDLE_SEC across blocks
-        time.sleep(0.15)
+        time.sleep(0.05)
         file2 = b'\x22' * 512
         comp2 = zlib.compress(file2)
         mid = len(comp2) // 2
@@ -271,12 +271,12 @@ def test_handle_client_multifile_flash_does_not_disconnect_mid_session(monkeypat
         # Send first block fragmented across two TCP writes to also exercise partial SLIP buffering
         cmd_a = protocol_client.make_command(protocol.CMD_FLASH_DEFL_DATA, struct.pack('<IIII', len(part_a), 0, 0, 0) + part_a)
         client.sendall(cmd_a[:5])
-        time.sleep(0.2)
+        time.sleep(0.6)
         raw = protocol_client.send_and_receive(client, cmd_a[5:])
         assert protocol_client.parse_response(server.slip_decode_frames(raw)[0])[1] == protocol.CMD_FLASH_DEFL_DATA
 
-        # Total elapsed since file 1's FLASH_DEFL_END is now well above 0.25s
-        time.sleep(0.2)
+        # Total elapsed since file 1's FLASH_DEFL_END is now well above 1.0s
+        time.sleep(0.6)
         raw = protocol_client.send_and_receive(
             client,
             protocol_client.make_command(protocol.CMD_FLASH_DEFL_DATA, struct.pack('<IIII', len(part_b), 1, 0, 0) + part_b),

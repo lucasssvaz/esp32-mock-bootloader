@@ -781,12 +781,12 @@ def handle_client(
     try:
         conn.set_timeout(_CLIENT_RECV_TIMEOUT)
         while not stop_event.is_set():
-            if flash_ended and not exit_on_disconnect:
-                if time.monotonic() - flash_end_at >= _FLASH_END_IDLE_SEC:
-                    break
             try:
                 chunk = conn.recv(_CLIENT_RECV_BUF_SIZE)
             except socket.timeout:
+                if flash_ended and not exit_on_disconnect:
+                    if time.monotonic() - flash_end_at >= _FLASH_END_IDLE_SEC:
+                        break
                 continue
             except OSError:
                 client_disconnected = True
