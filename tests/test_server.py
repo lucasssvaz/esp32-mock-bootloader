@@ -14,6 +14,7 @@ import struct
 import tempfile
 import threading
 import time
+import zlib
 from pathlib import Path
 
 import pytest
@@ -212,6 +213,101 @@ def test_handle_client_flash_end_idle_disconnect(bootloader_client):
         assert bootloader_client.recv(64) == b''
     except (ConnectionResetError, BrokenPipeError, OSError, socket.timeout):
         pass
+
+
+def test_handle_client_multifile_flash_does_not_disconnect_mid_session(monkeypatch):
+    """Regression: FLASH_DEFL_END(stay_in_loader=1) between files must not trigger idle disconnect."""
+    monkeypatch.setattr(server, '_FLASH_END_IDLE_SEC', 0.25)
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(('127.0.0.1', 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    stop_event = threading.Event()
+    flash = server.FlashImage()
+
+    def run_one() -> None:
+        conn, _ = srv.accept()
+        server.handle_client(server.BootloaderConnection(sock=conn), stop_event, 'esp32c3', flash=flash)
+
+    thread = threading.Thread(target=run_one, daemon=True)
+    thread.start()
+    client = socket.create_connection(('127.0.0.1', port), timeout=5.0)
+    try:
+        protocol_client.send_sync(client)
+        protocol_client.activate_stub(client)
+
+        # File 1: compressed write + FLASH_DEFL_END(stay_in_loader=1) + MD5
+        file1 = b'\x11' * 256
+        comp1 = zlib.compress(file1)
+        protocol_client.send_and_receive(
+            client,
+            protocol_client.make_command(protocol.CMD_FLASH_DEFL_BEGIN, struct.pack('<IIII', len(file1), 1, len(comp1), 0x0)),
+        )
+        protocol_client.send_and_receive(
+            client,
+            protocol_client.make_command(protocol.CMD_FLASH_DEFL_DATA, struct.pack('<IIII', len(comp1), 0, 0, 0) + comp1),
+        )
+        protocol_client.send_and_receive(
+            client,
+            protocol_client.make_command(protocol.CMD_FLASH_DEFL_END, struct.pack('<I', 1)),
+        )
+        time.sleep(0.15)
+        protocol_client.send_and_receive(
+            client,
+            protocol_client.make_command(protocol.CMD_SPI_FLASH_MD5, struct.pack('<IIII', 0x0, len(file1), 0, 0)),
+        )
+
+        # File 2 starts before idle expires, then takes longer than _FLASH_END_IDLE_SEC across blocks
+        time.sleep(0.15)
+        file2 = b'\x22' * 512
+        comp2 = zlib.compress(file2)
+        mid = len(comp2) // 2
+        part_a, part_b = comp2[:mid], comp2[mid:]
+        protocol_client.send_and_receive(
+            client,
+            protocol_client.make_command(protocol.CMD_FLASH_DEFL_BEGIN, struct.pack('<IIII', len(file2), 2, len(comp2), 0x10000)),
+        )
+        # Send first block fragmented across two TCP writes to also exercise partial SLIP buffering
+        cmd_a = protocol_client.make_command(protocol.CMD_FLASH_DEFL_DATA, struct.pack('<IIII', len(part_a), 0, 0, 0) + part_a)
+        client.sendall(cmd_a[:5])
+        time.sleep(0.2)
+        raw = protocol_client.send_and_receive(client, cmd_a[5:])
+        assert protocol_client.parse_response(server.slip_decode_frames(raw)[0])[1] == protocol.CMD_FLASH_DEFL_DATA
+
+        # Total elapsed since file 1's FLASH_DEFL_END is now well above 0.25s
+        time.sleep(0.2)
+        raw = protocol_client.send_and_receive(
+            client,
+            protocol_client.make_command(protocol.CMD_FLASH_DEFL_DATA, struct.pack('<IIII', len(part_b), 1, 0, 0) + part_b),
+        )
+        assert protocol_client.parse_response(server.slip_decode_frames(raw)[0])[1] == protocol.CMD_FLASH_DEFL_DATA
+        protocol_client.send_and_receive(
+            client,
+            protocol_client.make_command(protocol.CMD_FLASH_DEFL_END, struct.pack('<I', 1)),
+        )
+        assert flash.read(0x0, len(file1)) == file1
+        assert flash.read(0x10000, len(file2)) == file2
+    finally:
+        stop_event.set()
+        client.close()
+        srv.close()
+        thread.join(timeout=2)
+
+
+def test_flash_and_ram_out_of_bounds_slice_writes():
+    flash = server.FlashImage()
+    beyond = len(flash.data) + 64
+    flash.begin_plain(struct.pack('<IIII', 16, 1, 16, beyond))
+    flash.write_plain_block(struct.pack('<IIII', 4, 0, 0, 0) + b'ABCD')
+    comp = zlib.compress(b'EFGH')
+    flash.begin_defl(struct.pack('<IIII', 4, 1, len(comp), beyond))
+    flash.write_defl_block(struct.pack('<IIII', len(comp), 0, 0, 0) + comp)
+
+    ram = server.RamImage()
+    ram.begin(struct.pack('<IIII', 4, 1, 4, len(ram.data) + 16))
+    ram.write_block(struct.pack('<IIII', 4, 0, 0, 0) + b'WXYZ')
+    assert ram.data[-4:] == b'\x00' * 4
 
 
 def test_chip_session_image_chip_id_undetected():
@@ -460,6 +556,47 @@ def test_recv_slip_payload_returns_none_on_close():
     assert server._recv_slip_payload(conn, threading.Event(), bytearray()) is None
     peer.close()
     srv.close()
+
+
+def test_recv_slip_payload_retries_socket_timeout_until_ack():
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(('127.0.0.1', 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+
+    def delayed_sender() -> None:
+        client, _addr = srv.accept()
+        time.sleep(0.12)
+        client.sendall(server.slip_encode(struct.pack('<I', 64)))
+        client.close()
+
+    threading.Thread(target=delayed_sender, daemon=True).start()
+    peer = socket.create_connection(('127.0.0.1', port))
+    try:
+        conn = server.BootloaderConnection(sock=peer)
+        conn.set_timeout(0.03)
+        payload = server._recv_slip_payload(conn, threading.Event(), bytearray(), ack_timeout=1.0)
+        assert payload == struct.pack('<I', 64)
+        # Also verify ack_timeout expiry returns None cleanly
+        srv2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv2.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv2.bind(('127.0.0.1', 0))
+        srv2.listen(1)
+        p2 = srv2.getsockname()[1]
+        c2 = socket.create_connection(('127.0.0.1', p2))
+        a2, _ = srv2.accept()
+        try:
+            conn2 = server.BootloaderConnection(sock=c2)
+            conn2.set_timeout(0.02)
+            assert server._recv_slip_payload(conn2, threading.Event(), bytearray(), ack_timeout=0.05) is None
+        finally:
+            a2.close()
+            c2.close()
+            srv2.close()
+    finally:
+        peer.close()
+        srv.close()
 
 
 def test_perform_read_flash_stream_invalid_params():

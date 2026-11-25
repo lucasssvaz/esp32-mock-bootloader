@@ -23,7 +23,13 @@ from esp32_mock_bootloader import registers
 from esptool.targets import CHIP_DEFS
 
 _CLIENT_RECV_TIMEOUT = 0.05
+_CLIENT_RECV_BUF_SIZE = 65536
 _FLASH_END_IDLE_SEC = 3.0
+_READ_FLASH_ACK_TIMEOUT = 5.0
+_SLIP_END_BYTES = bytes([protocol.SLIP_END])
+_SLIP_ESC_BYTES = bytes([protocol.SLIP_ESC])
+_SLIP_ESC_END_SEQ = bytes([protocol.SLIP_ESC, protocol.SLIP_ESC_END])
+_SLIP_ESC_DD_SEQ = bytes([protocol.SLIP_ESC, protocol.SLIP_ESC_DD])
 
 
 class SpiPeripheralMock:
@@ -195,10 +201,9 @@ class FlashImage:
         except zlib.error:
             return
         off = self._defl_offset
-        for i, b in enumerate(decompressed):
-            pos = off + i
-            if pos < len(self.data):
-                self.data[pos] = b
+        if off < len(self.data):
+            end = min(off + len(decompressed), len(self.data))
+            self.data[off:end] = decompressed[:end - off]
         self._defl_offset += len(decompressed)
 
     def end_defl(self) -> None:
@@ -215,10 +220,9 @@ class FlashImage:
         data_len, _seq, _, _ = struct.unpack_from('<IIII', payload, 0)
         block = payload[16:16 + data_len]
         off = self._plain_offset
-        for i, b in enumerate(block):
-            pos = off + i
-            if pos < len(self.data):
-                self.data[pos] = b
+        if off < len(self.data):
+            end = min(off + len(block), len(self.data))
+            self.data[off:end] = block[:end - off]
         self._plain_offset += len(block)
 
     def erase_all(self) -> None:
@@ -272,10 +276,9 @@ class RamImage:
         data_len, _seq, _, _ = struct.unpack_from('<IIII', payload, 0)
         block = payload[16:16 + data_len]
         off = self._offset
-        for i, b in enumerate(block):
-            pos = off + i
-            if 0 <= pos < len(self.data):
-                self.data[pos] = b
+        if 0 <= off < len(self.data):
+            end = min(off + len(block), len(self.data))
+            self.data[off:end] = block[:end - off]
         self._offset += len(block)
 
 
@@ -311,16 +314,10 @@ def _checksum_error(session: ChipSession) -> int:
 
 
 def slip_encode(data: bytes) -> bytes:
-    out = bytearray([protocol.SLIP_END])
-    for b in data:
-        if b == protocol.SLIP_END:
-            out.extend([protocol.SLIP_ESC, protocol.SLIP_ESC_END])
-        elif b == protocol.SLIP_ESC:
-            out.extend([protocol.SLIP_ESC, protocol.SLIP_ESC_DD])
-        else:
-            out.append(b)
-    out.append(protocol.SLIP_END)
-    return bytes(out)
+    escaped = data.replace(_SLIP_ESC_BYTES, _SLIP_ESC_DD_SEQ).replace(
+        _SLIP_END_BYTES, _SLIP_ESC_END_SEQ,
+    )
+    return _SLIP_END_BYTES + escaped + _SLIP_END_BYTES
 
 
 def slip_decode_frames(raw: bytes) -> list[bytes]:
@@ -487,14 +484,16 @@ def handle_read_flash_slow(data: bytes, flash: FlashImage, session: ChipSession)
 
 def _consume_slip_frame(buf: bytearray) -> bytes | None:
     """Return the first decoded SLIP payload and remove it from buf."""
+    while len(buf) >= 2 and buf[0] == protocol.SLIP_END and buf[1] == protocol.SLIP_END:
+        del buf[0]
     raw = bytes(buf)
-    end = raw.find(bytes([protocol.SLIP_END]), 1)
+    end = raw.find(_SLIP_END_BYTES, 1)
     if end < 0:
         return None
     frames = slip_decode_frames(raw[:end + 1])
+    del buf[:end + 1]
     if not frames:
         return None
-    del buf[:end + 1]
     return frames[0]
 
 
@@ -502,14 +501,21 @@ def _recv_slip_payload(
     conn: BootloaderConnection,
     stop_event: threading.Event,
     buf: bytearray,
+    *,
+    ack_timeout: float = _READ_FLASH_ACK_TIMEOUT,
 ) -> bytes | None:
+    deadline = time.monotonic() + ack_timeout
     while not stop_event.is_set():
         payload = _consume_slip_frame(buf)
         if payload is not None:
             return payload
+        if time.monotonic() >= deadline:
+            return None
         try:
-            chunk = conn.recv(4096)
-        except (socket.timeout, OSError):
+            chunk = conn.recv(_CLIENT_RECV_BUF_SIZE)
+        except socket.timeout:
+            continue
+        except OSError:
             return None
         if not chunk:
             return None
@@ -779,7 +785,7 @@ def handle_client(
                 if time.monotonic() - flash_end_at >= _FLASH_END_IDLE_SEC:
                     break
             try:
-                chunk = conn.recv(4096)
+                chunk = conn.recv(_CLIENT_RECV_BUF_SIZE)
             except socket.timeout:
                 continue
             except OSError:
@@ -793,15 +799,19 @@ def handle_client(
                 client_disconnected = True
                 break
             buf.extend(chunk)
+            if flash_ended:
+                flash_end_at = time.monotonic()
 
-            frames = slip_decode_frames(bytes(buf))
-            if not frames:
+            if buf.count(protocol.SLIP_END) < 2:
                 continue
             last_end = buf.rfind(protocol.SLIP_END)
-            if last_end >= 0 and last_end < len(buf) - 1:
-                buf = buf[last_end + 1:]
+            frames = slip_decode_frames(bytes(buf[:last_end + 1]))
+            if last_end < len(buf) - 1:
+                del buf[:last_end]
             else:
                 buf.clear()
+            if not frames:
+                continue
 
             for frame in frames:
                 if len(frame) < 8:
@@ -828,6 +838,7 @@ def handle_client(
                 elif cmd == protocol.CMD_GET_SECURITY_INFO:
                     response = handle_get_security_info(session)
                 elif cmd == protocol.CMD_FLASH_BEGIN:
+                    flash_ended = False
                     flash.begin_plain(data)
                     response = make_response(cmd, stub=stub)
                 elif cmd == protocol.CMD_FLASH_DATA:
@@ -843,6 +854,7 @@ def handle_client(
                     flash_ended = True
                     flash_end_at = time.monotonic()
                 elif cmd == protocol.CMD_FLASH_DEFL_BEGIN:
+                    flash_ended = False
                     flash.begin_defl(data)
                     response = make_response(cmd, stub=stub)
                 elif cmd == protocol.CMD_FLASH_DEFL_DATA:
@@ -859,6 +871,7 @@ def handle_client(
                     flash_ended = True
                     flash_end_at = time.monotonic()
                 elif cmd == protocol.CMD_MEM_BEGIN:
+                    flash_ended = False
                     ram.begin(data)
                     response = make_response(cmd, stub=stub)
                 elif cmd == protocol.CMD_MEM_DATA:
@@ -893,6 +906,7 @@ def handle_client(
                 elif cmd == protocol.CMD_READ_FLASH_SLOW:
                     response = handle_read_flash_slow(data, flash, session)
                 elif cmd == protocol.CMD_ERASE_FLASH:
+                    flash_ended = False
                     if session.stub_active:
                         flash.erase_all()
                         response = make_response(cmd, stub=True)
@@ -901,6 +915,7 @@ def handle_client(
                             cmd, status=1, error=protocol.ROM_INVALID_MESSAGE, stub=False,
                         )
                 elif cmd == protocol.CMD_ERASE_REGION:
+                    flash_ended = False
                     if session.stub_active and len(data) >= 8:
                         offset, erase_size = struct.unpack_from('<II', data, 0)
                         flash.erase_region(offset, erase_size)
@@ -963,6 +978,8 @@ def handle_client(
                     except OSError:
                         client_disconnected = True
                         break
+                    if flash_ended:
+                        flash_end_at = time.monotonic()
             if client_disconnected:
                 break
     finally:
@@ -1055,7 +1072,7 @@ def run_server(
         if port == 0:
             raise
         srv.bind((bind, 0))
-    srv.listen(1)
+    srv.listen(8)
     actual_port = srv.getsockname()[1]
 
     if port_file:
@@ -1221,7 +1238,7 @@ def _run_windows_pty_server(
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(('127.0.0.1', 0))
     port = srv.getsockname()[1]
-    srv.listen(1)
+    srv.listen(8)
     endpoint = f'socket://127.0.0.1:{port}'
     _write_serial_endpoint(port_file, endpoint)
     _tcp_listen_loop(

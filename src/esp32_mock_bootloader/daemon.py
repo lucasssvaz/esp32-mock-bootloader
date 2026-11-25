@@ -269,18 +269,18 @@ def wait_for_port(port: int, bind: str = DEFAULT_BIND, timeout: float = 30.0) ->
 def _spawn_detached(cmd: list[str], log_file: Path) -> subprocess.Popen[bytes]:
     log_str = os.fspath(log_file)
     os.makedirs(os.path.dirname(log_str), exist_ok=True)
-    log_fd = open(log_str, 'a', encoding='utf-8')
-    kwargs: dict[str, Any] = {
-        'stdout': log_fd,
-        'stderr': subprocess.STDOUT,
-        'stdin': subprocess.DEVNULL,
-        'env': os.environ.copy(),
-    }
-    if os.name == 'nt':
-        kwargs['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
-    else:
-        kwargs['start_new_session'] = True
-    return subprocess.Popen(cmd, **kwargs)
+    with open(log_str, 'a', encoding='utf-8') as log_fd:
+        kwargs: dict[str, Any] = {
+            'stdout': log_fd,
+            'stderr': subprocess.STDOUT,
+            'stdin': subprocess.DEVNULL,
+            'env': os.environ.copy(),
+        }
+        if os.name == 'nt':
+            kwargs['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
+        else:
+            kwargs['start_new_session'] = True
+        return subprocess.Popen(cmd, **kwargs)
 
 
 def start_daemon(
